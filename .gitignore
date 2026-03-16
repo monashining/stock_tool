@@ -1,0 +1,23 @@
+# 環境變數與機密
+.env
+.env.local
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 資料檔（含個人持倉，勿上傳）
+my_portfolio.csv

@@ -1,0 +1,50 @@
+{
+  "mode_default": "bottom",
+  "structure": {
+    "lookback": 10,
+    "swing_window": 5,
+    "support_buffer": 0.002
+  },
+  "momentum": {
+    "rsi_period": 14,
+    "div_lookback": 3,
+    "use_macd": false,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70
+  },
+  "volume": {
+    "ma_window": 20,
+    "compare_window": 4,
+    "dry_up_ratio": 0.6,
+    "top_range_window": 5,
+    "top_drop_mult": 1.5
+  },
+  "chip": {
+    "foreign_days": 3,
+    "trust_days": 3,
+    "require_both": false
+  },
+  "bias": {
+    "ma_window": 20,
+    "overheat_pct_top": 8.0
+  },
+  "decision": {
+    "bottom": {
+      "allow_score": 2,
+      "watch_score": 1
+    },
+    "top": {
+      "block_score": 3,
+      "watch_score": 1
+    }
+  },
+  "top_shield": {
+    "enabled": true,
+    "ma_window": 5
+  },
+  "top_trend_filter": {
+    "enabled": false,
+    "ma_window": 20,
+    "block_score_add": 1
+  }
+}
