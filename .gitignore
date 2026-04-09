@@ -21,3 +21,8 @@ env/
 
 # 資料檔（含個人持倉，勿上傳）
 my_portfolio.csv
+
+# 實際交易／日誌（勿上傳；保留目錄用 .gitkeep）
+data/portfolio/*.csv
+data/portfolio/*.parquet
+!data/portfolio/.gitkeep

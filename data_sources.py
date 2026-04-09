@@ -364,9 +364,32 @@ def _load_data_raw(symbol, period):
     return df
 
 
-@st.cache_data(ttl=300)  # 盤中 5 分鐘更新
+def _normalize_symbol_for_cache(symbol: str) -> str:
+    """正規化股票代號，確保切換股票時 cache key 一致，避免吃到錯檔資料"""
+    if not symbol or not isinstance(symbol, str):
+        return str(symbol or "")
+    s = symbol.strip()
+    if not s:
+        return s
+    # 台股：純數字補上 .TW，避免 "2367" 與 "2367.TW" 產生不同 cache
+    if s.isdigit():
+        return f"{s}.TW"
+    return s
+
+
+@st.cache_data(ttl=300)  # 盤中 5 分鐘更新；用正規化 symbol 當 key，切換股票會正確取新資料
+def _load_data_cached(normalized_symbol: str, period: str):
+    """內部：cache 以 normalized_symbol 為 key，確保 2367 與 2367.TW 共用同一筆"""
+    df = _load_data_raw(normalized_symbol, period)
+    if df is None or df.empty:
+        return df
+    # 回傳 copy，避免 caller 對 df 的修改污染 cache
+    return df.copy()
+
+
 def load_data(symbol, period):
-    return _load_data_raw(symbol, period)
+    norm = _normalize_symbol_for_cache(str(symbol or ""))
+    return _load_data_cached(norm, period)
 
 
 @st.cache_data(ttl=300)
@@ -375,7 +398,7 @@ def load_data_batch(symbols, period="1y"):
     一次抓多檔資料（比逐檔 yf.download 快很多）
     回傳：dict[str, DataFrame]，key = symbol（和輸入一致）
     """
-    symbols = [s.strip() for s in symbols if s and s.strip()]
+    symbols = [s.strip() for s in (symbols or []) if s and str(s).strip()]
     if not symbols:
         return {}
 

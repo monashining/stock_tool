@@ -29,6 +29,11 @@ class BacktestSummary:
     expectancy: float
     profit_factor: float
     trades_df: pd.DataFrame
+    # 即時診斷用（回測參數連動）
+    hold_days: int = 10
+    trailing_stop_pct: float = 0.0
+    exit_ema_window: int = 0
+    current_status: Optional[Dict[str, Any]] = None
 
 
 def _ensure_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -54,10 +59,9 @@ def backtest_buy_signal(
 
     - 進場：BUY_SIGNAL 從 False 變 True 的當根收盤
     - 出場（誰先到）：
-      1) 狀態降級：BUY_SIGNAL 變 False
-      2) exit_ema_window >= 2：收盤跌破 EMA(exit_ema_window) 才出場
-      3) 移動止損：從進場後最高點回檔 trailing_stop_pct%
-      4) 持有期滿：hold_days 天
+      1) exit_ema_window >= 2：收盤跌破 EMA(exit_ema_window) 出場（不再依賴 BUY_SIGNAL 降級）
+      2) 移動止損：從進場後最高點回檔 trailing_stop_pct%
+      3) 持有期滿：hold_days 天
 
     回傳欄位與 backtest_turn_signals 相容
     """
@@ -107,36 +111,24 @@ def backtest_buy_signal(
         trigger_type = str(df["BUY_TRIGGER_TYPE"].iloc[i]) if "BUY_TRIGGER_TYPE" in df.columns else "NONE"
 
         max_exit_pos = min(len(df) - 1, i + hold_days)
-        signal_after = df["BUY_SIGNAL"].astype(bool).iloc[i + 1 : max_exit_pos + 1]
 
-        # 狀態降級
-        downgrade_pos = None
-        downgrade_mask = (~signal_after).fillna(False).values
-        if downgrade_mask.any():
-            rel = int(np.argmax(downgrade_mask))
-            downgrade_pos = int(i + 1 + rel)
-
+        # 出場：純粹依賴「跌破 EMA」與「持有期滿」（不再依賴 BUY_SIGNAL 降級）
         status_exit_pos = int(max_exit_pos)
         status_exit_reason = "HOLDING" if status_exit_pos == (len(df) - 1) else "TIMEOUT"
 
         if exit_ema_s is not None and max_exit_pos >= (i + 1):
             close_after = close_s.iloc[i + 1 : max_exit_pos + 1]
             ma_after = exit_ema_s.iloc[i + 1 : max_exit_pos + 1]
-            confirm = (
-                (~signal_after)
-                & close_after.notna()
+            ema_break = (
+                close_after.notna()
                 & ma_after.notna()
                 & (close_after < ma_after)
             )
-            if bool(confirm.any()):
-                rel = int(np.argmax(confirm.values))
+            if bool(ema_break.any()):
+                rel = int(np.argmax(ema_break.values))
                 status_exit_pos = int(i + 1 + rel)
-                status_exit_reason = f"DOWNGRADE+EMA{exit_ema_window}_BREAK"
-            elif downgrade_pos is not None:
-                status_exit_reason = f"DOWNGRADE_NO_EMA{exit_ema_window}_BREAK_{status_exit_reason}"
-        elif downgrade_pos is not None:
-            status_exit_pos = int(downgrade_pos)
-            status_exit_reason = "BUY_SIGNAL_OFF"
+                status_exit_reason = f"EMA{exit_ema_window}_BREAK"
+        # 若 exit_ema_window == 0：維持持有期滿出場（status_exit_pos = max_exit_pos）
 
         status_exit_price = float(close_s.iloc[status_exit_pos])
         if not np.isfinite(status_exit_price) or status_exit_price <= 0:
@@ -313,6 +305,32 @@ def run_backtest(
     if trades is None or trades.empty:
         return None
     metrics = compute_backtest_metrics(trades, win_threshold_pct=win_threshold_pct)
+
+    # 即時診斷：從最新 K 線與最後一筆出場推斷現況
+    current_status: Optional[Dict[str, Any]] = None
+    if df is not None and not df.empty:
+        try:
+            last_close = float(df["Close"].iloc[-1])
+            bias20 = float(df["Bias20"].iloc[-1]) if "Bias20" in df.columns else 0.0
+            ema5 = float(df["EMA5"].iloc[-1]) if "EMA5" in df.columns else last_close
+            last_high = float(df["High"].iloc[-1]) if "High" in df.columns else last_close
+            last_exit = (
+                str(trades["exit_reason"].iloc[-1])
+                if "exit_reason" in trades.columns and len(trades) > 0
+                else "N/A"
+            )
+            current_status = {
+                "is_hot": bias20 > 15,
+                "last_exit_reason": last_exit,
+                "suggested_action": "HOLD" if last_close > ema5 else "EXIT",
+                "last_close": last_close,
+                "last_high": last_high,
+                "ema5": ema5,
+                "bias20": bias20,
+            }
+        except Exception:
+            current_status = None
+
     return BacktestSummary(
         strategy=strategy,
         symbol=symbol,
@@ -325,4 +343,8 @@ def run_backtest(
         expectancy=float(metrics["expectancy"]) if np.isfinite(metrics["expectancy"]) else 0.0,
         profit_factor=float(metrics["profit_factor"]) if np.isfinite(metrics["profit_factor"]) else 0.0,
         trades_df=trades,
+        hold_days=hold_days,
+        trailing_stop_pct=float(trailing_stop_pct or 0),
+        exit_ema_window=int(exit_ema_window or 0),
+        current_status=current_status,
     )

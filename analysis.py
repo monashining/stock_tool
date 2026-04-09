@@ -252,9 +252,9 @@ def compute_buy_signals(df):
         df["Is_Dangerous_Volume"] = False
         return df
 
-    # ---------- Gate（維持你原本邏輯） ----------
+    # ---------- Gate（放寬成交量：防爆量交給 Guard，避免與 BREAKOUT 衝突） ----------
     trend_ok = (df["Close"] > df["SMA20"]) & (df["SMA20"] > df["SMA20"].shift(5))
-    risk_ok = (df["Volume"] <= 1.5 * df["VolMA20"]) & (df["Bias20"].abs() <= 10)
+    risk_ok = (df["Volume"] <= 3.0 * df["VolMA20"]) & (df["Bias20"].abs() <= 10)
     gate_ok = trend_ok & risk_ok
 
     # ---------- Trigger（新增 CONTINUATION） ----------
@@ -286,8 +286,8 @@ def compute_buy_signals(df):
     close_pos = (df["Close"] - df["Low"]) / k_range
     breakout_close_strong = close_pos >= 0.6
     vol_ratio = df["Volume"] / df["VolMA20"].replace(0, np.nan)
-    not_crazy_volume = vol_ratio <= 2.0
-    not_too_hot = df["Bias20"] <= 9.5
+    not_crazy_volume = vol_ratio <= 3.0
+    not_too_hot = df["Bias20"] <= 15.0
     avwap_support = df["AVWAP"].isna() | (df["Close"] >= df["AVWAP"])
     guard_ok = np.where(
         (trigger_type == "BREAKOUT") | (trigger_type == "CONTINUATION"),
@@ -310,8 +310,8 @@ def compute_buy_signals(df):
     reason_close = np.where(
         ~breakout_close_strong, "收盤不夠強（上影偏長/假突破風險）", ""
     )
-    reason_vol = np.where(~not_crazy_volume, "量能過熱（>2.0x 20日均量）", "")
-    reason_hot = np.where(~not_too_hot, "乖離接近過熱上限（>9.5%）", "")
+    reason_vol = np.where(~not_crazy_volume, "量能過熱（>3.0x 20日均量）", "")
+    reason_hot = np.where(~not_too_hot, "乖離接近過熱上限（>15%）", "")
 
     reason_avwap = np.where(
         ~avwap_support, "跌回 Anchored VWAP 下方（成本線失守）", ""

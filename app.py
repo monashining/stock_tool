@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, time as dt_time
+from datetime import date, datetime, time as dt_time
 from zoneinfo import ZoneInfo
 from copy import deepcopy
 
@@ -64,6 +64,17 @@ from turn_check_engine import (
 from tomorrow_guard_price import calc_tomorrow_guard
 from precision_diagnosis import diagnose_precision
 from price_prediction_ui import render_price_prediction_panel
+from portfolio_journal import (
+    NEAR_LOCKED_TARGET_THRESHOLD_PCT,
+    close_trade,
+    create_trade,
+    last_bar_date_from_ohlcv_df,
+    list_open_trades,
+    load_journal,
+    prepare_df_for_journal,
+    summarize_open_trades_for_ui,
+    update_open_trades_daily,
+)
 
 # =========================
 # Indicator taxonomy (分類字典)
@@ -193,6 +204,27 @@ def send_with_cooldown(event_key, message, cooldown_minutes=30):
     if ok:
         st.session_state[cache_key] = now
     return ok, msg
+
+
+def load_prepared_df_for_journal(symbol: str, time_range: str = "1y") -> pd.DataFrame:
+    """載入 OHLCV 並計算指標與 BUY_*，供持倉日誌更新使用。"""
+    sym = (symbol or "").strip()
+    if not sym:
+        return pd.DataFrame()
+    raw = load_data(sym, time_range)
+    if raw is None or raw.empty:
+        raw = _load_data_raw(sym, time_range)
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = [
+            "_".join([str(x) for x in col if x is not None]) for col in raw.columns
+        ]
+    raw.columns = raw.columns.str.strip()
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        if col in raw.columns:
+            raw[col] = pd.to_numeric(raw[col], errors="coerce")
+    return prepare_df_for_journal(raw)
 
 
 def is_taiwan_market_open(now):
@@ -1004,7 +1036,6 @@ if name:
     title_suffix = f"｜{name}"
     if resolved_symbol and resolved_symbol != ticker.strip():
         title_suffix = f"{title_suffix}（{resolved_symbol}）"
-title_placeholder.title(f"鹹魚翻身：策略監控站{title_suffix}")
 effective_symbol = (resolved_symbol or ticker or "").strip()
 if not effective_symbol:
     st.error("請輸入有效的股票代碼")
@@ -1014,10 +1045,51 @@ time_range = st.sidebar.selectbox(
     ["1mo", "3mo", "6mo", "1y", "5y"],
     index=1,
 )
-page = st.sidebar.radio("頁面", ["主控台", "回測", "持股清單", "廣播"], index=0)
+st.sidebar.markdown("### 功能分區")
+nav_zone = st.sidebar.radio(
+    "模組",
+    ["看盤與推播", "回測與持股"],
+    index=0,
+    key="sidebar_nav_zone",
+    help="看盤與推播：即時圖表、策略面板與 LINE 廣播。回測與持股：歷史回測與部位／交易日誌。",
+    label_visibility="visible",
+)
+st.sidebar.caption(
+    "看盤與推播＝主控台、廣播　｜　回測與持股＝回測、持股清單"
+)
+if nav_zone == "看盤與推播":
+    page = st.sidebar.radio(
+        "頁面",
+        ["主控台", "廣播"],
+        index=0,
+        horizontal=True,
+        key="sidebar_page_watch",
+    )
+else:
+    page = st.sidebar.radio(
+        "頁面",
+        ["回測", "持股清單"],
+        index=0,
+        horizontal=True,
+        key="sidebar_page_research",
+    )
+
+# 標題：持股清單／回測／廣播與側邊欄單股無關，避免「標題台積電、表格別檔」的誤導
+if page == "持股清單":
+    title_placeholder.title("鹹魚翻身：策略監控站｜持股清單")
+elif page == "回測":
+    title_placeholder.title("鹹魚翻身：策略監控站｜策略回測")
+elif page == "廣播":
+    title_placeholder.title("鹹魚翻身：策略監控站｜廣播")
+else:
+    title_placeholder.title(f"鹹魚翻身：策略監控站{title_suffix}")
+
 show_chip_unit_check = False
 with st.sidebar.expander("🧩 進階/除錯", expanded=False):
     show_chip_unit_check = st.checkbox("顯示籌碼單位檢查", value=False)
+    if st.button("🔄 清除資料快取", help="切換股票後若資料沒更新，點此強制重新抓取"):
+        st.cache_data.clear()
+        st.rerun()
 
 # TURN 參數：側邊欄即時調整（只影響主控台）
 turn_cfg_base = load_turn_config()
@@ -1338,6 +1410,552 @@ elif page == "持股清單":
     st.header("持股清單")
     st.caption("輸入格式：股票代碼, 成本均價, 股數（股數以「股」為單位；成本/股數可省略）")
     st.caption("持股清單指標以 1y 日線資料計算（與主頁顯示範圍無關）。")
+
+    st.subheader("Open Trades（交易日誌）")
+    st.caption(
+        "未結案交易來自 `data/portfolio/trades.csv`。"
+        "無買賣的日子仍應定期按「更新 journal」：每個交易日會累積一筆持有中快照（價格、目標距離、損益、風險與趨勢欄位），非交易事件。"
+        "下列最新收盤為 1y 資料之最後一根 bar；**持有天數**＝進場日至「行情最後 bar 日」之日曆天；"
+        "**行情最後 bar 日**用來對照 **最後更新 bar 日**（journal）是否落後。"
+        "距鎖定目標欄位已做成文字提示（已達標／接近／%）；**風險／市場狀態**取自最新 journal，未更新時為 —。"
+        "**Journal 與行情**：比對「行情最後 bar 日」與「最後更新 bar 日」；落後時請先批次更新 journal 再判讀動態欄位。"
+        "**已賣出要結案**：展開下方 **📓 真實持倉交易日誌（可回測用）** 的 **結案**，選 `trade_id`、填出場日／價後按 **✅ 結案（CLOSE）**（會寫入 `trades.csv` 並停止後續 OPEN journal）。"
+    )
+
+    with st.expander("📓 真實持倉交易日誌（可回測用）", expanded=True):
+        st.caption(
+            "寫入專案內 `data/portfolio/trades.csv` 與 `trade_daily_journal.csv`。"
+            "：**建倉**只在你實際買進時按一次；**持有期間**請用本頁下方「批次更新 OPEN journal」為 OPEN 補上每日快照。"
+            "建倉時會以你在表單填的 **標的** 抓取 1y 日線並計算指標後寫入進場快照（與側邊欄看盤代碼無關）。進場／結案在表單內送出。"
+        )
+        with st.form(key="portfolio_journal_pf_create_form"):
+            pf_pj_sym = st.text_input(
+                "建倉標的（含 .TW）",
+                value="",
+                key="portfolio_journal_pf_entry_symbol",
+                placeholder="例：3037.TW",
+                help="僅在此填寫要建檔的標的；送出後才依該代碼下載資料。",
+            )
+            pc1, pc2, pc3 = st.columns(3)
+            with pc1:
+                pf_pj_entry_date = st.date_input(
+                    "進場日",
+                    value=date.today(),
+                    key="portfolio_journal_pf_entry_date",
+                )
+            with pc2:
+                pf_pj_entry_price = st.number_input(
+                    "進場價",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.01,
+                    format="%.2f",
+                    key="portfolio_journal_pf_entry_price",
+                )
+            with pc3:
+                pf_pj_shares = st.number_input(
+                    "股數",
+                    min_value=0,
+                    value=0,
+                    step=1,
+                    key="portfolio_journal_pf_shares",
+                )
+            pf_pj_entry_reason = st.selectbox(
+                "進場理由代碼",
+                ["MANUAL", "BUY_SIGNAL", "IMPORT"],
+                index=0,
+                key="portfolio_journal_pf_entry_reason",
+            )
+            pf_pj_stop_loss = st.number_input(
+                "停損參考價（0＝不記錄）",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                format="%.2f",
+                key="portfolio_journal_pf_stop",
+            )
+            pf_pj_notes = st.text_input(
+                "備註（可空白）", key="portfolio_journal_pf_notes"
+            )
+            st.markdown(
+                "**選填：覆寫鎖定目標**（留白則用進場當下動態目標區間）"
+            )
+            pl1, pl2 = st.columns(2)
+            with pl1:
+                pf_pj_lock_lo = st.number_input(
+                    "locked 低",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.01,
+                    format="%.2f",
+                    key="portfolio_journal_pf_lock_lo",
+                )
+            with pl2:
+                pf_pj_lock_hi = st.number_input(
+                    "locked 高",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.01,
+                    format="%.2f",
+                    key="portfolio_journal_pf_lock_hi",
+                )
+            pf_pj_submit_create = st.form_submit_button(
+                "➕ 建立 OPEN 交易並寫入進場日 Journal",
+            )
+
+        if pf_pj_submit_create:
+            _sym_c = (pf_pj_sym or "").strip()
+            _df_c = (
+                load_prepared_df_for_journal(_sym_c, "1y")
+                if _sym_c
+                else pd.DataFrame()
+            )
+            if not _sym_c:
+                st.warning("請填建倉標的。")
+            elif _df_c.empty:
+                st.warning(f"無法載入 `{_sym_c}` 的資料，請確認代碼。")
+            elif pf_pj_entry_price <= 0 or pf_pj_shares <= 0:
+                st.warning("請填進場價與股數（須大於 0）。")
+            else:
+                if pf_pj_entry_reason == "BUY_SIGNAL" and not bool(
+                    _df_c.iloc[-1].get("BUY_SIGNAL")
+                ):
+                    st.info(
+                        "提醒：該標的最後一日並無 BUY_SIGNAL；理由仍會依你選擇存成 BUY_SIGNAL。"
+                    )
+                _tid_pf = create_trade(
+                    _sym_c,
+                    pf_pj_entry_date.isoformat(),
+                    float(pf_pj_entry_price),
+                    shares=int(pf_pj_shares),
+                    entry_reason=str(pf_pj_entry_reason),
+                    df_at_entry=_df_c.copy(),
+                    locked_tp_low=float(pf_pj_lock_lo) if pf_pj_lock_lo > 0 else None,
+                    locked_tp_high=float(pf_pj_lock_hi) if pf_pj_lock_hi > 0 else None,
+                    stop_loss_price=float(pf_pj_stop_loss)
+                    if pf_pj_stop_loss > 0
+                    else None,
+                    notes=str(pf_pj_notes or ""),
+                )
+                st.success(f"已建立 trade_id = `{_tid_pf}`")
+                st.rerun()
+
+        _pj_pf_open_journal = list_open_trades()
+        _pj_trade_entry_snapshot_cols = (
+            "dynamic_tp_low_at_entry",
+            "dynamic_tp_high_at_entry",
+            "valuation_low_at_entry",
+            "valuation_high_at_entry",
+        )
+        if not _pj_pf_open_journal.empty:
+            st.markdown("**目前 OPEN**")
+            st.caption(
+                "主表以 **locked_tp_*** 為這筆的計畫目標；"
+                "進場當下的 **dynamic / valuation at entry** 為快照，"
+                "目前版本常與 locked 數字相同（見進階說明）。**trades.csv 仍保留完整欄位。**"
+            )
+            _pj_open_main_cols = [
+                c
+                for c in _pj_pf_open_journal.columns
+                if c not in _pj_trade_entry_snapshot_cols
+            ]
+            st.dataframe(
+                _pj_pf_open_journal[_pj_open_main_cols],
+                hide_index=True,
+                width="stretch",
+            )
+            with st.expander(
+                "進階：進場目標快照（dynamic / valuation at entry）", expanded=False
+            ):
+                st.caption(
+                    "**dynamic_tp_*_at_entry**：進場那一刻系統算出的動態目標快照，寫入後不改。"
+                    " **valuation_*_at_entry**：預留給未來獨立估值帶；"
+                    "Phase A 仍來自同一組 target bundle，故常與 dynamic 相同。"
+                    "未手填 locked 時，locked 預設等於當時 dynamic。"
+                )
+                _pj_snap_disp_cols = [
+                    "trade_id",
+                    "symbol",
+                ] + [
+                    c
+                    for c in _pj_trade_entry_snapshot_cols
+                    if c in _pj_pf_open_journal.columns
+                ]
+                st.dataframe(
+                    _pj_pf_open_journal[_pj_snap_disp_cols],
+                    hide_index=True,
+                    width="stretch",
+                )
+            st.markdown("**結案**")
+            _pj_pf_ids_j = _pj_pf_open_journal["trade_id"].astype(str).tolist()
+            pf_pj_close_id = st.selectbox(
+                "trade_id",
+                _pj_pf_ids_j,
+                key="portfolio_journal_pf_close_pick",
+            )
+            _m_sym_row = _pj_pf_open_journal["trade_id"].astype(str) == str(
+                pf_pj_close_id
+            )
+            _close_sym = (
+                str(_pj_pf_open_journal.loc[_m_sym_row, "symbol"].iloc[0])
+                if _m_sym_row.any()
+                else str(_pj_pf_open_journal.iloc[0]["symbol"])
+            )
+            _df_exit_pf = load_prepared_df_for_journal(_close_sym, "1y")
+            _exit_px_def = (
+                float(pd.to_numeric(_df_exit_pf["Close"], errors="coerce").iloc[-1])
+                if _df_exit_pf is not None
+                and not _df_exit_pf.empty
+                and "Close" in _df_exit_pf.columns
+                else 0.0
+            )
+            with st.form(key="portfolio_journal_pf_close_form"):
+                cx2, cx3 = st.columns(2)
+                with cx2:
+                    pf_pj_exit_date = st.date_input(
+                        "出場日",
+                        value=date.today(),
+                        key="portfolio_journal_pf_exit_date",
+                    )
+                with cx3:
+                    pf_pj_exit_price = st.number_input(
+                        "出場價（預設：該標的最後收盤）",
+                        min_value=0.0,
+                        value=float(_exit_px_def or 0.0),
+                        step=0.01,
+                        format="%.2f",
+                        key="portfolio_journal_pf_exit_price",
+                    )
+                pf_pj_exit_reason = st.text_input(
+                    "出場原因",
+                    key="portfolio_journal_pf_exit_reason",
+                )
+                pf_pj_submit_close = st.form_submit_button("✅ 結案（CLOSE）")
+            if pf_pj_submit_close:
+                if pf_pj_exit_price <= 0:
+                    st.warning("出場價須大於 0。")
+                else:
+                    _ok_pf = close_trade(
+                        pf_pj_close_id,
+                        pf_pj_exit_date.isoformat(),
+                        float(pf_pj_exit_price),
+                        str(pf_pj_exit_reason or ""),
+                    )
+                    if _ok_pf:
+                        st.success("已結案。")
+                        st.rerun()
+                    else:
+                        st.warning("結案失敗（找不到、或該筆非 OPEN）。")
+        else:
+            st.caption("尚無 OPEN 交易時僅能建倉；結案欄位會在建立 OPEN 後出現。")
+
+        _pj_pf_j = load_journal()
+        if not _pj_pf_j.empty:
+            _pj_pf_jfilter = st.text_input(
+                "Journal 檢視標的（空白＝全部最近）",
+                value="",
+                key="portfolio_journal_pf_jfilter",
+                placeholder="例：3037.TW",
+            )
+            _pj_pf_jsym = str(_pj_pf_jfilter or "").strip()
+            if _pj_pf_jsym:
+                _pj_pf_jview = _pj_pf_j[
+                    _pj_pf_j["symbol"].astype(str).str.strip() == _pj_pf_jsym
+                ].tail(30)
+            else:
+                _pj_pf_jview = _pj_pf_j.tail(30)
+            st.markdown(
+                f"**Journal 檢視（`{_pj_pf_jsym or '全部最近'}`，最多 30 列）** · 全檔共 {len(_pj_pf_j)} 列"
+            )
+            st.caption(
+                "Journal 的 `date` 欄＝該列對應的日線 bar 日期（持有中每日快照，非買賣事件）。"
+            )
+            st.dataframe(_pj_pf_jview, hide_index=True, width="stretch")
+
+    _pj_pf_open = list_open_trades()
+    if _pj_pf_open.empty:
+        st.info("尚無 OPEN 交易。可在上方 📓 真實持倉交易日誌建立持倉紀錄。")
+    else:
+        _pj_pf_syms = sorted(
+            set(_pj_pf_open["symbol"].astype(str).str.strip().tolist())
+        )
+        _pj_pf_batch = load_data_batch(_pj_pf_syms, period="1y")
+        _pj_pf_close: dict[str, float | None] = {}
+        _pj_pf_mkt_bar: dict[str, str | None] = {}
+        for _s in _pj_pf_syms:
+            _dh = _pj_pf_batch.get(_s)
+            if _dh is not None and not _dh.empty and "Close" in _dh.columns:
+                try:
+                    _pj_pf_close[_s] = float(
+                        pd.to_numeric(_dh["Close"], errors="coerce").iloc[-1]
+                    )
+                    _pj_pf_mkt_bar[_s] = last_bar_date_from_ohlcv_df(_dh)
+                except Exception:
+                    _pj_pf_close[_s] = None
+                    _pj_pf_mkt_bar[_s] = None
+            else:
+                try:
+                    _dh2 = load_data(_s, "1y")
+                    if (
+                        _dh2 is not None
+                        and not _dh2.empty
+                        and "Close" in _dh2.columns
+                    ):
+                        _pj_pf_close[_s] = float(
+                            pd.to_numeric(_dh2["Close"], errors="coerce").iloc[-1]
+                        )
+                        _pj_pf_mkt_bar[_s] = last_bar_date_from_ohlcv_df(_dh2)
+                    else:
+                        _pj_pf_close[_s] = None
+                        _pj_pf_mkt_bar[_s] = None
+                except Exception:
+                    _pj_pf_close[_s] = None
+                    _pj_pf_mkt_bar[_s] = None
+
+        _pj_sum = summarize_open_trades_for_ui(
+            _pj_pf_close,
+            market_last_bar_date_by_symbol=_pj_pf_mkt_bar,
+        )
+        _pj_disp = _pj_sum.rename(
+            columns={
+                "entry_date": "進場日",
+                "days_held": "持有天數",
+                "market_last_bar_date": "行情最後 bar 日",
+                "entry_price": "進場價",
+                "shares": "股數",
+                "latest_close": "最新收盤（最後 bar）",
+                "unrealized_pnl": "未實現損益",
+                "return_pct": "報酬%",
+                "locked_tp_high": "鎖定目標價",
+                "dynamic_tp_high": "動態目標（參考）",
+                "distance_to_locked_high_pct": "距鎖定目標 (%)",
+                "distance_to_dynamic_high_pct": "距動態目標 (%)（參考）",
+                "drawdown_from_peak_pct": "自高點回撤 (%)",
+                "trend_ok": "趨勢狀態",
+                "risk_ok": "風險狀態",
+                "regime_type": "市場狀態",
+                "last_journal_bar_date": "最後更新 bar 日",
+                "journal_stale_flag": "Journal 與行情",
+            }
+        )
+
+        def _pj_fmt_journal_stale(v) -> str:
+            try:
+                if v is None or pd.isna(v):
+                    return "無法比對"
+            except Exception:
+                return "無法比對"
+            if v == True:  # noqa: E712
+                return "待補寫（落後行情）"
+            if v == False:  # noqa: E712
+                return "已同步"
+            return "無法比對"
+
+        def _pj_fmt_dist_locked(v) -> str:
+            try:
+                if v is None or (isinstance(v, float) and np.isnan(v)):
+                    return "—"
+                x = float(v)
+            except Exception:
+                return "—"
+            if x <= 0:
+                return "已達標"
+            if x <= 3:
+                return f"接近（{x:.2f}%）"
+            return f"{x:.2f}%"
+
+        def _pj_fmt_drawdown(v) -> str:
+            try:
+                if v is None or (isinstance(v, float) and np.isnan(v)):
+                    return "—"
+                x = float(v)
+            except Exception:
+                return "—"
+            if x <= -8:
+                return f"高回撤（{x:.2f}%）"
+            if x <= -5:
+                return f"留意（{x:.2f}%）"
+            return f"{x:.2f}%"
+
+        def _pj_fmt_trend(s) -> str:
+            t = str(s).strip() if s is not None else ""
+            if t == "否":
+                return "否 · 留意"
+            return t if t else "—"
+
+        def _pj_target_status_label(tr, nr, d_lock) -> str:
+            t_na = pd.isna(tr)
+            n_na = pd.isna(nr)
+            if t_na and n_na:
+                return "—"
+            if not t_na and bool(tr):
+                return "已達鎖定"
+            if not n_na and bool(nr):
+                try:
+                    if pd.notna(d_lock) and np.isfinite(float(d_lock)):
+                        return f"接近（{float(d_lock):.2f}%）"
+                except (TypeError, ValueError):
+                    pass
+                return "接近"
+            return ""
+
+        def _pj_status_sort_priority(label: str) -> int:
+            if label == "已達鎖定":
+                return 0
+            if isinstance(label, str) and label.startswith("接近"):
+                return 1
+            if label == "—":
+                return 3
+            return 2
+
+        _pj_disp["距鎖定目標 (%)"] = _pj_sum["distance_to_locked_high_pct"].map(
+            _pj_fmt_dist_locked
+        )
+        _pj_disp["距動態目標 (%)（參考）"] = _pj_sum[
+            "distance_to_dynamic_high_pct"
+        ].map(_pj_fmt_dist_locked)
+        _pj_disp["自高點回撤 (%)"] = _pj_sum["drawdown_from_peak_pct"].map(
+            _pj_fmt_drawdown
+        )
+        _pj_disp["趨勢狀態"] = _pj_sum["trend_ok"].map(_pj_fmt_trend)
+        _pj_disp["風險狀態"] = _pj_sum["risk_ok"].map(_pj_fmt_trend)
+        _pj_disp["Journal 與行情"] = _pj_sum["journal_stale_flag"].map(
+            _pj_fmt_journal_stale
+        )
+        _pj_disp["目標狀態"] = [
+            _pj_target_status_label(tr, nr, dlk)
+            for tr, nr, dlk in zip(
+                _pj_sum["target_reached_flag"],
+                _pj_sum["near_locked_target_flag"],
+                _pj_sum["distance_to_locked_high_pct"],
+            )
+        ]
+
+        _pj_col_order = [
+            "symbol",
+            "trade_id",
+            "進場日",
+            "持有天數",
+            "行情最後 bar 日",
+            "進場價",
+            "股數",
+            "最新收盤（最後 bar）",
+            "報酬%",
+            "未實現損益",
+            "鎖定目標價",
+            "距鎖定目標 (%)",
+            "目標狀態",
+            "動態目標（參考）",
+            "距動態目標 (%)（參考）",
+            "自高點回撤 (%)",
+            "趨勢狀態",
+            "風險狀態",
+            "市場狀態",
+            "最後更新 bar 日",
+            "Journal 與行情",
+        ]
+        _pj_disp = _pj_disp[[c for c in _pj_col_order if c in _pj_disp.columns]]
+        for _pj_dc in ("行情最後 bar 日", "最後更新 bar 日"):
+            if _pj_dc in _pj_disp.columns:
+                _pj_disp[_pj_dc] = _pj_disp[_pj_dc].replace("", "—")
+
+        _pj_disp = _pj_disp.assign(
+            _sort_p=_pj_disp["目標狀態"].map(_pj_status_sort_priority),
+            _sort_d=pd.to_numeric(
+                _pj_sum["distance_to_locked_high_pct"], errors="coerce"
+            ),
+        ).sort_values(
+            by=["_sort_p", "_sort_d"],
+            ascending=[True, True],
+            na_position="last",
+        )
+        _pj_disp = _pj_disp.drop(columns=["_sort_p", "_sort_d"])
+
+        st.caption(
+            "**持股決策表**：主軸為 **鎖定目標／距鎖定**（交易計畫，來自 trades 主檔）。"
+            "**排序**：已達鎖定 → 接近（距鎖定由小到大）→ 其餘。**接近**欄位會附帶實際距離%。"
+            f"**目標狀態**：**已達鎖定**＝最新收盤 ≥ 鎖定目標上緣；**接近**＝尚未已達且距鎖定目標在 **(0%，{NEAR_LOCKED_TARGET_THRESHOLD_PCT:g}%]**（其餘為實質未達，欄位留空）。"
+            "**動態（參考）** 取自最新 journal，代表模型當下重算的延伸空間，非紀律主目標。"
+            "**進場快照**（dynamic/valuation at entry）不在此表，請見 📓「進階：進場目標快照」。"
+        )
+        st.dataframe(
+            _pj_disp,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "鎖定目標價": st.column_config.NumberColumn(
+                    format="%.2f",
+                    help="計畫目標（locked_tp_high）。",
+                ),
+                "動態目標（參考）": st.column_config.NumberColumn(
+                    format="%.2f",
+                    help="最新 journal 之 dynamic_tp_high，每日更新，僅供對照。",
+                ),
+                "持有天數": st.column_config.NumberColumn(format="%.0f"),
+                "進場價": st.column_config.NumberColumn(format="%.2f"),
+                "最新收盤（最後 bar）": st.column_config.NumberColumn(format="%.2f"),
+                "報酬%": st.column_config.NumberColumn(format="%.2f"),
+                "未實現損益": st.column_config.NumberColumn(format="%.0f"),
+            },
+        )
+
+        with st.expander("批次更新 OPEN journal", expanded=True):
+            _pj_ms = st.multiselect(
+                "要更新的 symbol（留空＝全部）",
+                options=_pj_pf_syms,
+                default=_pj_pf_syms,
+                key="portfolio_page_pj_multiselect",
+            )
+            _pj_only_miss = st.checkbox(
+                "僅更新「尚缺目前最後一根 K 線日期」之 journal",
+                value=False,
+                key="portfolio_page_pj_only_miss",
+            )
+            _pj_show_detail = st.checkbox(
+                "更新後顯示成功／跳過／失敗明細",
+                value=True,
+                key="portfolio_page_pj_show_detail",
+            )
+            if st.button("🔄 依選取更新 OPEN journal", key="portfolio_page_pj_update_btn"):
+                _pj_sym_arg: list[str] | None
+                if not _pj_ms or set(_pj_ms) == set(_pj_pf_syms):
+                    _pj_sym_arg = None
+                else:
+                    _pj_sym_arg = list(_pj_ms)
+                _pj_rep_pf = update_open_trades_daily(
+                    fetch_df=lambda s: load_prepared_df_for_journal(s, "1y"),
+                    symbols=_pj_sym_arg,
+                    only_missing_today=_pj_only_miss,
+                )
+                st.success(
+                    f"成功 {len(_pj_rep_pf.updated)} 筆；"
+                    f"跳過 {len(_pj_rep_pf.skipped)}；失敗 {len(_pj_rep_pf.failed)}。"
+                )
+                if _pj_show_detail:
+                    st.markdown("**已更新 trade_id**")
+                    st.write(
+                        ", ".join(_pj_rep_pf.updated)
+                        if _pj_rep_pf.updated
+                        else "（無）"
+                    )
+                    if _pj_rep_pf.skipped:
+                        st.markdown("**跳過**")
+                        st.dataframe(
+                            pd.DataFrame(_pj_rep_pf.skipped),
+                            hide_index=True,
+                            width="stretch",
+                        )
+                    if _pj_rep_pf.failed:
+                        st.markdown("**失敗（資料不足或 snapshot 錯誤）**")
+                        st.dataframe(
+                            pd.DataFrame(_pj_rep_pf.failed),
+                            hide_index=True,
+                            width="stretch",
+                        )
+                st.rerun()
+
+    st.markdown("---")
+
     use_live_price = st.checkbox("使用即時價（可能較慢）", value=False)
     DEFAULT_PORTFOLIO_TEXT = "2330.TW, 610, 1000\n2317.TW, 98.5, 2000\n2882.TW"
     if "portfolio_raw_symbols" not in st.session_state:
@@ -3126,6 +3744,10 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
                 applied_pos = st.form_submit_button("✅ 套用設定（更新下車指令）")
             if applied_pos:
                 st.success("已套用持倉設定（下車指令已更新）")
+
+        st.caption(
+            "📓 **交易日誌（建倉／結案）** 已移到左側「持股清單」頁統一操作。"
+        )
 
         # 🏁 下車指南（白話文決策）：移到「圖表設定」上方
         # 先算 3 日籌碼（供 TURN 引擎使用）

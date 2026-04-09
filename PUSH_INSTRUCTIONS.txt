@@ -1,0 +1,10 @@
+# 推送到 GitHub 的指令
+
+建立好 stock_tool 倉庫後，在專案資料夾執行：
+
+git remote add origin https://github.com/Mona-YWC/stock_tool.git
+git branch -M main
+git push -u origin main
+
+若已設定 remote，只需執行：
+git push -u origin main
