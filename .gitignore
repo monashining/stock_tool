@@ -27,3 +27,5 @@ data/portfolio/*.csv
 data/portfolio/*.parquet
 !data/portfolio/.gitkeep
 data/*.db
+
+tools/*.exe
