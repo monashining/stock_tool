@@ -9,6 +9,14 @@ import pandas as pd
 import streamlit as st
 
 from data_sources import fetch_last_price, fetch_fundamental_snapshot
+from final_decision_resolver import (
+    ACTION_UI,
+    FinalAction,
+    FinalColor,
+    ResolvedDecision,
+    group_reason_codes,
+)
+from plain_language_narrator import DipBuyVerdict, PlainLanguageSummary
 from position_advice import get_position_advice
 from tomorrow_guard_price import calc_tomorrow_guard
 from analysis import estimate_target_range, analyze_chip_flow, compute_volume_sum_3d
@@ -40,6 +48,78 @@ def _ema_fallback(close: pd.Series, span: int) -> Optional[float]:
         return None
 
 
+def render_plain_language_block(
+    placeholder: Any,
+    summary: PlainLanguageSummary,
+    dip: DipBuyVerdict,
+) -> None:
+    """頂卡下方：四行白話 + 撿便宜一句 + 術語對照。"""
+    with placeholder.container():
+        st.markdown("### 🗣 白話翻譯")
+        st.caption("把指標與裁決翻成可讀結論（不取代 ResolvedDecision）。")
+        if (summary.one_line_verdict or "").strip():
+            st.info(f"**一句話：** {summary.one_line_verdict}")
+        st.write("**1. 現在是什麼狀態**")
+        st.write(summary.current_state)
+        st.write("**2. 為什麼現在不是舒服買點**")
+        st.write(summary.why_not_buy)
+        st.write("**3. 現在該做什麼**")
+        st.write(summary.action_now)
+        st.write("**4. 看到什麼才改變看法**")
+        st.write(summary.what_to_wait_for)
+        st.divider()
+        st.markdown("**撿便宜判斷**（can_buy_the_dip）")
+        if dip.allowed:
+            st.success(dip.explanation)
+        else:
+            st.warning(dip.explanation)
+        if summary.term_notes:
+            with st.expander("術語對照（字典）", expanded=False):
+                for line in summary.term_notes:
+                    st.markdown(f"- {line}")
+
+
+def render_page_top_conclusion(
+    placeholder: Any,
+    decision: Optional[ResolvedDecision],
+    *,
+    symbol: str = "",
+) -> None:
+    """
+    個股頁頂部主結論卡：僅使用 ResolvedDecision（與全站契約一致）。
+    第一行：燈號＋動作；第二行：state；第三行：summary_text；展開：分組原因＋ trace。
+    """
+    with placeholder.container():
+        st.markdown("### 主結論")
+        if symbol:
+            st.caption(symbol)
+        if decision is None:
+            st.info("資料不足，尚無法產生 ResolvedDecision。")
+            return
+
+        ui = ACTION_UI[decision.action]
+        st.markdown(f"## {ui['emoji']} **{ui['label']}** · {decision.summary_title}")
+        st.markdown(f"**{decision.state.value}**")
+        st.write(decision.summary_text)
+        st.caption(f"主因：`{decision.primary_reason.value}`")
+
+        groups = group_reason_codes(decision.reason_codes)
+        with st.expander("原因分組／追蹤 trace", expanded=False):
+            if groups.price_reasons:
+                st.markdown("**價格／結構**")
+                st.code(" / ".join(x.value for x in groups.price_reasons))
+            if groups.risk_reasons:
+                st.markdown("**風控**")
+                st.code(" / ".join(x.value for x in groups.risk_reasons))
+            if groups.narrative_reasons:
+                st.markdown("**建倉敘述／Gate·Trigger·Guard**")
+                st.code(" / ".join(x.value for x in groups.narrative_reasons))
+            if decision.trace_lines:
+                st.markdown("**trace**")
+                for line in decision.trace_lines:
+                    st.text(line)
+
+
 def render_position_advice_panel(
     df: pd.DataFrame,
     *,
@@ -55,6 +135,9 @@ def render_position_advice_panel(
     trailing_stop_pct: float = 10.0,
     foreign_net_series: Optional[pd.Series] = None,
     trust_net_series: Optional[pd.Series] = None,
+    ai_score: float | None = None,
+    exec_guard_ok: bool | None = None,
+    position_mode: bool = True,
 ):
     """
     持倉決策面板（白話文 + 儀表板）
@@ -104,11 +187,56 @@ def render_position_advice_panel(
         ema_defense=defense,
         bottom_result=bottom_result,
         top_result=top_result,
+        ema5_short=ema5,
+        ema20_trend=ema20,
+        ai_score=ai_score,
+        guard_ok=exec_guard_ok,
+        position_mode=position_mode,
     )
-    advice_suggests_reduce = (
+    advice_suggests_reduce = bool(
+        advice.resolution is not None
+        and advice.resolution.action
+        in (FinalAction.REDUCE, FinalAction.WATCH, FinalAction.EXIT)
+    ) or (
         advice.level in ("warning", "error")
-        and ("減碼" in advice.headline or "分批" in advice.headline or "落袋" in advice.headline)
+        and (
+            "減碼" in advice.headline
+            or "分批" in advice.headline
+            or "落袋" in advice.headline
+            or "出場" in advice.headline
+        )
     )
+
+    if advice.resolution is not None:
+        r = advice.resolution
+        _cm = {
+            FinalColor.GREEN: ("#dcfce7", "#166534", "🟢"),
+            FinalColor.YELLOW: ("#fef9c3", "#854d0e", "🟡"),
+            FinalColor.RED: ("#fee2e2", "#991b1b", "🔴"),
+        }
+        traffic_bg, traffic_fg, label = _cm[r.color]
+        codes_s = ", ".join(x.value for x in r.reason_codes)
+        st.markdown("### ⚖️ 最終決策（單一結論）")
+        st.markdown(
+            f"""
+<div style="background-color:{traffic_bg}; padding:14px 16px; border-radius:12px; border:2px solid {traffic_fg};">
+  <div style="font-size:18px; font-weight:700; color:{traffic_fg};">{label} {r.summary_title}</div>
+  <div style="margin-top:8px; color:{traffic_fg}; font-size:14px;">
+    STATE=<code>{r.state.value}</code>｜primary=<code>{r.primary_reason.value}</code>
+  </div>
+  <div style="margin-top:6px; color:{traffic_fg}; font-size:14px;">{r.summary_text}</div>
+  <div style="margin-top:6px; color:{traffic_fg}; font-size:13px;">
+    {" / ".join(r.trace_lines)}
+  </div>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption(f"reason_codes：{codes_s}")
+        st.caption(
+            "合併規則：依 FinalAction 嚴重度（EXIT>REDUCE>WATCH>HOLD）取最嚴；"
+            "同 action 時燈號紅>黃>綠。"
+        )
 
     # ---------------- 🛡️ 實戰副駕駛系統（決策層） ----------------
     # 計算保命價（以防守線 EMA + buffer 作為「保守警戒」）
@@ -166,6 +294,12 @@ def render_position_advice_panel(
         break_price = float(guard.break_close)  # 破線（EMA）
         buf_guard = ((float(cp) / float(guard_price)) - 1.0) * 100.0 if guard_price else 0.0
 
+        hard_ema5_broken = (
+            ema5 is not None
+            and float(ema5) > 0
+            and float(cp) < float(ema5)
+        )
+
         # 三段式：綠（高於保守警戒）/ 黃（低於保守警戒但未破線）/ 紅（破線）
         if float(cp) >= float(guard_price):
             status_color = "#dcfce7"  # 淺綠
@@ -185,6 +319,15 @@ def render_position_advice_panel(
             text_color = "#991b1b"
             action_text = "🚨 破線警戒：股價已跌破防守線"
             instruction = f"指令：**收盤前若站不回 {defense_name}，請執行減碼/出場。**"
+
+        if hard_ema5_broken:
+            status_color = "#fee2e2"
+            text_color = "#991b1b"
+            action_text = "🚨 短線失控：已跌破 EMA5（硬風控，優先於月線／結構敘述）"
+            instruction = (
+                f"指令：**收盤價低於 EMA5（{float(ema5):.2f}）**—決策優先權最高；"
+                f"請減碼或出場，勿只因仍守在 {defense_name} 就解讀成可續抱。"
+            )
 
         # TURN 狀態（簡短帶過，避免資訊過載）
         b = bottom_result or {}
@@ -259,7 +402,16 @@ def render_position_advice_panel(
         guard_p = float(guard.guard_close)
         b_status = str((bottom_result or {}).get("status", "NA"))
         buy_zone = ""
-        if b_status == "ALLOW":
+        short_broken = (
+            ema5 is not None
+            and float(close_last) < float(ema5)
+        )
+        if short_broken:
+            buy_zone = (
+                f"短線已跌破 EMA5（{float(ema5):.2f}），**不建議**依敘述積極買進；"
+                f"若要做多請等收盤站回 EMA5 並搭配 Gate/Trigger/Guard。"
+            )
+        elif b_status == "ALLOW":
             buy_zone = f"回踩 **{defense:.2f}** 元（{defense_name}）可買｜或現價 **{close_last:.2f}** 元附近分批"
         else:
             buy_zone = f"等 TURN bottom 轉 ALLOW 後，回踩 **{defense:.2f}** 元可買"
@@ -559,6 +711,15 @@ def render_position_advice_panel(
             st.info(
                 f"🟡 **【高位監控】** 燈號已轉為 {status}（score={score}）。目前獲利 {pr_txt}。"
                 f"建議將出場點設為收盤跌破 {defense_name}。"
+            )
+        elif (
+            advice.resolution is not None
+            and advice.resolution.action
+            in (FinalAction.REDUCE, FinalAction.WATCH, FinalAction.EXIT)
+        ):
+            st.warning(
+                f"⚠️ **【與最終決策一致】** {advice.resolution.summary_title} "
+                "（此處不以 top 分數覆蓋硬風控／AI／Guard 結論。）"
             )
         else:
             st.success("💎 **【獲利奔跑中】** 目前尚未觸發減碼/下車訊號，可續抱。")

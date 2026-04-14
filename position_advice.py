@@ -4,6 +4,14 @@ from dataclasses import dataclass
 from typing import Any, Literal, Optional
 import math
 
+from final_decision_resolver import (
+    DecisionInput,
+    FinalAction,
+    ReasonCode,
+    ResolvedDecision,
+    resolve_final_decision,
+)
+
 
 AdviceLevel = Literal["info", "success", "warning", "error"]
 
@@ -13,6 +21,7 @@ class PositionAdvice:
     level: AdviceLevel
     headline: str
     bullets: list[str]
+    resolution: Optional[ResolvedDecision] = None
 
 
 def _to_float(x: Any) -> Optional[float]:
@@ -55,12 +64,20 @@ def get_position_advice(
     ema_defense: Any = None,
     bottom_result: Optional[dict[str, Any]] = None,
     top_result: Optional[dict[str, Any]] = None,
+    ema5_short: Any = None,
+    ema20_trend: Any = None,
+    ai_score: Any = None,
+    guard_ok: Optional[bool] = None,
+    gate_pass: Optional[bool] = None,
+    trigger_pass: Optional[bool] = None,
+    guard_pass: Optional[bool] = None,
+    position_mode: bool = True,
 ) -> PositionAdvice:
     """
     持倉管理（不寫死個人持股）：用「均價/股數 + TURN bottom/top 結果 + 防守均線」
     產出更接近人類交易的具體建議。
 
-    回傳：PositionAdvice(level/headline/bullets)
+    裁決層統一走 resolve_final_decision(DecisionInput)。
     """
     c = _to_float(current_price)
     a = _to_float(avg_cost)
@@ -118,40 +135,102 @@ def get_position_advice(
     ema_bias = bias_pct(c, ema) if ema is not None else None
     below_defense = (ema is not None and c < ema) if ema is not None else None
 
-    # --- 規則（可再逐步擴充） ---
     bullets: list[str] = []
+    resolution: Optional[ResolvedDecision] = None
+    level: AdviceLevel
+    headline: str
 
-    # 1) 位階高 + 已有利潤 + top 風險升溫：強烈減碼
-    if p >= 15.0 and (t_status == "BLOCK" or t_score >= 3) and (bias_hit or (ema_bias is not None and ema_bias >= 7.0)):
+    if p <= -5.0:
+        resolution = resolve_final_decision(
+            DecisionInput(
+                close=c,
+                pnl_pct=p,
+                position_mode=position_mode,
+                gate_pass=gate_pass,
+                trigger_pass=trigger_pass,
+                guard_pass=guard_pass if guard_pass is not None else guard_ok,
+            )
+        )
+        bullets.extend(list(resolution.trace_lines))
+        bullets.append("條件：未實現損益 ≤ -5%。")
+        bullets.append("建議：若 bottom 未回到 WATCH/ALLOW，請嚴格執行停損或降部位。")
+        level = "error"
+        headline = resolution.summary_title
+
+    elif _to_float(ema5_short) is not None:
+        e5 = _to_float(ema5_short)
+        e20 = _to_float(ema20_trend)
+        inp = DecisionInput(
+            close=c,
+            ema5=e5,
+            ema20=e20,
+            defensive_line=ema,
+            weighted_ai_score=_to_float(ai_score),
+            bottom_status=b_status if b_status != "NA" else None,
+            top_status=t_status if t_status != "NA" else None,
+            exec_guard_ok=guard_ok,
+            gate_pass=gate_pass,
+            trigger_pass=trigger_pass,
+            guard_pass=guard_pass if guard_pass is not None else guard_ok,
+            position_mode=position_mode,
+        )
+        resolution = resolve_final_decision(inp)
+        act = resolution.action
+        if act == FinalAction.EXIT:
+            level = "error"
+        elif act == FinalAction.REDUCE and resolution.primary_reason == ReasonCode.PRICE_BELOW_EMA5:
+            level = "error"
+        elif act in (FinalAction.REDUCE, FinalAction.WATCH):
+            level = "warning"
+        elif act == FinalAction.HOLD:
+            level = "success"
+        else:
+            level = "info"
+        headline = resolution.summary_title
+        bullets.extend(list(resolution.trace_lines))
+        if (
+            resolution.primary_reason == ReasonCode.PRICE_BELOW_EMA5
+            and ReasonCode.PRICE_ABOVE_EMA20 in resolution.reason_codes
+        ):
+            bullets.append(
+                "情境：趨勢未死（價在 EMA20 上）但短線已失 EMA5—最忌『捨不得砍、慢慢被吃』。"
+            )
+        if p >= 15.0 and (t_status == "BLOCK" or t_score >= 3) and (
+            bias_hit or (ema_bias is not None and ema_bias >= 7.0)
+        ):
+            bullets.append(
+                "補充：已有不小獲利且 top 風險升溫，即使型態尚可也可先分批落袋。"
+            )
+        if below_defense is True and resolution.primary_reason != ReasonCode.PRICE_BELOW_EMA5:
+            if ema is not None:
+                bullets.append(
+                    f"你選的防守線（{ema:.2f}）已跌破—請一併檢視是否同步減碼。"
+                )
+            else:
+                bullets.append("已跌破自選防守線—請一併檢視是否同步減碼。")
+        if t_status in ["WATCH", "BLOCK"] or bias_hit:
+            bullets.append("top 風險升溫：若續漲可先落袋一部分，避免回吐。")
+
+    elif p >= 15.0 and (t_status == "BLOCK" or t_score >= 3) and (bias_hit or (ema_bias is not None and ema_bias >= 7.0)):
         bullets.append("條件：Profit > 15% 且 top 風險升溫（含乖離過熱）。")
         bullets.append("建議：分批減碼 30–50%（先回收獲利，避免回吐）。")
         if ema is not None:
             bullets.append(f"防守點：跌破防守線（約 {ema:.2f}）可再減碼/出清。")
-        level: AdviceLevel = "error" if t_status == "BLOCK" else "warning"
+        level = "error" if t_status == "BLOCK" else "warning"
         headline = "高位階警示：建議分批減碼"
 
-    # 2) top 分數不低 + 跌破 EMA5：建議減碼（獲利保護）
     elif below_defense is True and (t_score >= 2 or t_status in ["WATCH", "BLOCK"]) and p > 0:
         bullets.append("條件：跌破防守線 + top 轉弱（或分數偏高）。")
         bullets.append("建議：先減碼 1/3 或直接落袋（依你的波段/短線習慣）。")
         level = "warning"
         headline = "跌破防守：建議先減碼/落袋"
 
-    # 3) 成本防禦（靠近成本 + bottom 不強）
     elif (-1.0 <= p <= 2.0) and b_score < 2:
         bullets.append("條件：現價接近成本（+2%~-1%）且 bottom 分數不足。")
         bullets.append("建議：以成本價做本金防守；破成本可考慮出場避免小虧變大虧。")
         level = "warning"
         headline = "成本防禦：本金保護優先"
 
-    # 4) 虧損擴大（簡易停損提醒）
-    elif p <= -5.0:
-        bullets.append("條件：未實現損益 ≤ -5%。")
-        bullets.append("建議：若 bottom 未回到 WATCH/ALLOW，請嚴格執行停損或降部位。")
-        level = "error"
-        headline = "停損提醒：虧損已擴大"
-
-    # 5) 預設：續抱/觀察
     else:
         if b_status == "ALLOW" and t_status == "ALLOW" and not bias_hit:
             level = "success"
@@ -164,12 +243,12 @@ def get_position_advice(
         if t_status in ["WATCH", "BLOCK"] or bias_hit:
             bullets.append("top 風險升溫：若續漲可先落袋一部分，避免回吐。")
 
-    # --- 加上數字摘要（可讀性更好） ---
     bullets.insert(0, f"未實現損益：約 {p:.1f}%")
     if pnl_amt is not None:
         bullets.insert(1, f"未實現損益金額：約 {pnl_amt:,.0f}")
     if ema is not None:
         bullets.append(f"防守線（EMA）參考：約 {ema:.2f}")
 
-    return PositionAdvice(level=level, headline=headline, bullets=bullets)
-
+    return PositionAdvice(
+        level=level, headline=headline, bullets=bullets, resolution=resolution
+    )

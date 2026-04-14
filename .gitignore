@@ -26,3 +26,4 @@ my_portfolio.csv
 data/portfolio/*.csv
 data/portfolio/*.parquet
 !data/portfolio/.gitkeep
+data/*.db

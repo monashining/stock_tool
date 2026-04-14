@@ -19,7 +19,6 @@ from linebot.v3.messaging import (
 )
 from analysis import (
     check_global_buy_strategy,
-    check_volume_risk,
     compute_buy_signals,
     compute_indicators,
     compute_risk_metrics,
@@ -51,7 +50,30 @@ from utils import (
     to_scalar,
 )
 from position_advice import get_position_advice
-from position_advice_ui import render_position_advice_panel
+from line_push_formatter import COMPACT_SHORT_RISK_MAX, build_line_push_payload
+from plain_language_narrator import (
+    PlainLanguageNarratorInput,
+    build_plain_language_summary,
+    can_buy_the_dip,
+)
+from position_advice_ui import (
+    render_page_top_conclusion,
+    render_plain_language_block,
+    render_position_advice_panel,
+)
+from final_decision_resolver import (
+    DecisionInput,
+    EntryNarrativeTier,
+    expert_action_line_markdown,
+    FinalAction,
+    ReasonCode,
+    ResolvedDecision,
+    get_status_bar_label,
+    get_status_bar_label_for_score,
+    get_status_bar_title,
+    resolve_entry_narrative_tier,
+    resolve_final_decision,
+)
 from turn_check_ui import render_turn_check_panel
 from turn_check_engine import (
     backtest_turn_signals,
@@ -74,6 +96,13 @@ from portfolio_journal import (
     prepare_df_for_journal,
     summarize_open_trades_for_ui,
     update_open_trades_daily,
+)
+from expert_advice_text import generate_expert_advice
+from indicator_used_map import (
+    build_fail_lines_from_used_map,
+    build_fail_lines_short_from_used_map,
+    build_used_map_for_signals,
+    get_primary_risk_category,
 )
 
 # =========================
@@ -120,6 +149,8 @@ st.set_page_config(page_title="Cursor 股票工具", layout="wide")
 load_dotenv()
 
 title_placeholder = st.empty()
+page_conclusion_placeholder = st.empty()
+plain_language_placeholder = st.empty()
 expert_placeholder = st.empty()
 latest_metrics_placeholder = st.empty()
 diagnosis_summary = st.empty()
@@ -236,105 +267,6 @@ def is_taiwan_market_open(now):
 tw_now = datetime.now(ZoneInfo("Asia/Taipei"))
 if is_taiwan_market_open(tw_now):
     st.success("即時監控中")
-
-
-def generate_expert_advice(
-    df, ticker_name, score, risk_metrics, is_chip_divergence=False
-):
-    if df is None or df.empty or len(df) < 2:
-        return "資料不足，無法產生專家講評。"
-
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    k_range = latest["High"] - latest["Low"]
-    upper_shadow = latest["High"] - max(latest["Open"], latest["Close"])
-    lower_shadow = min(latest["Open"], latest["Close"]) - latest["Low"]
-    body = abs(latest["Close"] - latest["Open"])
-
-    analysis = []
-    display_name = ticker_name or "此標的"
-
-    is_dangerous_vol = bool(latest.get("Is_Dangerous_Volume"))
-    is_pulling_out = is_dangerous_vol and is_chip_divergence
-
-    # 過熱判斷（避免「強力多頭」與「籌碼背離」同時出現造成矛盾）
-    bias20 = None
-    try:
-        b = latest.get("Bias20")
-        bias20 = float(b) if (b is not None and not pd.isna(b)) else None
-    except Exception:
-        bias20 = None
-    is_overheat = bias20 is not None and float(bias20) > 15.0
-    chip_distribution = bool(is_chip_divergence and is_overheat)
-
-    if chip_distribution:
-        analysis.append(
-            f"**高檔派發中**：{display_name} 評分 {score}，但出現「乖離過熱（Bias20>15%）+ 籌碼背離」。"
-            "這種狀態常見於『外資趁強撤退、投信苦撐』，短線容易急殺洗盤。"
-        )
-    elif score >= 80:
-        analysis.append(f"**強力多頭配置**：{display_name} 評分高達 {score}，動能強勁。")
-    elif score >= 60:
-        if is_pulling_out:
-            analysis.append(
-                f"**高度警戒**：{display_name} 評分 {score}，但偵測到「拉高出貨」徵兆（爆量黑K + 籌碼背離）。"
-            )
-        else:
-            analysis.append(
-                f"**趨勢穩定**：{display_name} 評分 {score}，屬於標準多方形態。"
-            )
-    else:
-        analysis.append(
-            f"**觀望保守**：{display_name} 評分 {score}，建議等待更明確的點火訊號。"
-        )
-
-    if body > 0 and lower_shadow > body * 1.5:
-        analysis.append("**下方支撐強勁**：長下影線顯示回測後有買盤承接。")
-    if body > 0 and upper_shadow > body * 1.5 and latest.get("BUY_TRIGGER_TYPE") == "BREAKOUT":
-        analysis.append("**假突破風險**：創高但上影線過長，須防範套牢壓力。")
-    if latest.get("Is_Dangerous_Volume"):
-        analysis.append(
-            "**注意：高檔放量收黑**。雖然有人接手，但目前空方力道大於多方，建議觀察 3 天。"
-        )
-    volume_risk = check_volume_risk(df)
-    if volume_risk:
-        analysis.append(volume_risk)
-
-    if (
-        risk_metrics
-        and risk_metrics.get("beta", 1) is not None
-        and risk_metrics.get("beta", 1) > 1.5
-    ):
-        analysis.append(
-            f"**波動警告**：Beta 偏高 ({risk_metrics['beta']:.2f})，操作需嚴守停損。"
-        )
-
-    if chip_distribution:
-        advice = (
-            "**行動：減碼觀望**。乖離過熱且籌碼背離，建議先落袋一部分（或至少不再加碼），"
-            "以 EMA5/EMA20 作為防守線，收盤守住再談續抱。"
-        )
-    elif is_pulling_out:
-        advice = "**行動：果斷減碼**。偵測到籌碼與量價同步轉惡，建議減碼至 2 成以下或清倉。"
-    elif is_dangerous_vol:
-        advice = "**行動：減碼觀望**。高檔爆量收黑，守住今日低點再考慮續抱。"
-    elif latest.get("BUY_SIGNAL"):
-        advice = (
-            f"**行動：符合進場標準 ({latest.get('BUY_TRIGGER_TYPE')})**。"
-            "建議在平盤附近分批佈局。"
-        )
-    elif latest.get("Close") < latest.get("SMA20"):
-        advice = "**行動：減碼觀望**。跌破 SMA20，在站回前不宜貿然接刀。"
-    elif bias20 is not None and abs(float(bias20)) > 10:
-        advice = (
-            "**行動：持倉可續抱，建倉暫觀望**。結構未破壞但乖離過熱（Bias20≈{:.1f}%），"
-            "追高風險大；建倉請等乖離回落。".format(float(bias20))
-        )
-    else:
-        advice = "**行動：持股續抱**。目前雖無新訊號，但結構未被破壞。"
-
-    return "\n\n".join(analysis) + "\n\n---\n" + advice
 
 
 def render_conflict_warning(is_chip_divergence, is_dangerous_vol):
@@ -585,17 +517,6 @@ def render_gate_trigger_guard_reminders(
 
 def build_metrics_snapshot(**kwargs) -> dict:
     return dict(kwargs)
-
-
-def rule_item(key: str, rule: str, value, threshold: str, passed: bool, note: str = "") -> dict:
-    return {
-        "key": key,
-        "rule": rule,
-        "value": value,
-        "threshold": threshold,
-        "pass": passed,
-        "note": note,
-    }
 
 
 def render_warning_wall(used_map: dict):
@@ -2039,6 +1960,7 @@ elif page == "持股清單":
         symbols = symbols[:MAX_SYMBOLS]
 
     rows = []
+    plain_full_by_symbol: dict[str, str] = {}
     batch_missing_fixed = []
     still_missing = []
     resolved_map = {}
@@ -2046,6 +1968,22 @@ elif page == "持股清單":
     resolved_list = []
     turn_cfg = load_turn_config()
     turn_mode_default = turn_cfg.get("mode_default", "bottom")
+
+    def _portfolio_turn_display(tr, score_max: int) -> tuple[str, float]:
+        """狀態 + 分數/滿分（bottom 0–4、top 0–5，與 TURN 引擎一致）。"""
+        if not isinstance(tr, dict):
+            return "", np.nan
+        st = str(tr.get("status") or "").strip()
+        if not st:
+            return "", np.nan
+        raw = tr.get("score")
+        try:
+            s = int(float(raw))
+        except (TypeError, ValueError):
+            return st, np.nan
+        if not np.isfinite(s):
+            return st, np.nan
+        return f"{st} {s}/{score_max}", float(s)
 
     for it in items:
         sym = it["symbol"]
@@ -2136,6 +2074,17 @@ elif page == "持股清單":
                     "每張達標可賺": np.nan,
                     "距離達標%": np.nan,
                     "AI 分數": np.nan,
+                    "final_action": "",
+                    "final_color": "",
+                    "final_state": "",
+                    "primary_reason": "",
+                    "summary_title": "",
+                    "summary_text": "",
+                    "plain_summary_short": "",
+                    "TURN_bottom": "",
+                    "TURN_top": "",
+                    "TURN_bottom_score": np.nan,
+                    "TURN_top_score": np.nan,
                 }
             )
             continue
@@ -2214,17 +2163,6 @@ elif page == "持股清單":
             if trust_used is not None and len(trust_used) >= 3
             else None
         )
-        # 若籌碼資料未啟用/不足，改用 NaN 避免 TURN chip 條件被「默認通過」
-        foreign_3d_for_turn = (
-            float(foreign_3d_net)
-            if foreign_3d_net is not None and np.isfinite(foreign_3d_net)
-            else np.nan
-        )
-        trust_3d_for_turn = (
-            float(trust_3d_net)
-            if trust_3d_net is not None and np.isfinite(trust_3d_net)
-            else np.nan
-        )
         foreign_sell_3d = None
         try:
             if foreign_used is not None and len(foreign_used) >= 3:
@@ -2238,13 +2176,44 @@ elif page == "持股清單":
         df_turn = df_hold.copy()
         if "RSI" not in df_turn.columns and "RSI14" in df_turn.columns:
             df_turn["RSI"] = df_turn["RSI14"]
-        turn_result = run_turn_check(
-            df_turn,
-            foreign_3d_net=foreign_3d_for_turn,
-            trust_3d_net=trust_3d_for_turn,
-            mode=turn_mode_default,
-            cfg=turn_cfg,
+        # 與主控台個股頁一致：bottom / top 各跑一次，再餵進 DecisionInput
+        chip_f3_pf = (
+            float(foreign_3d_net)
+            if foreign_3d_net is not None and np.isfinite(foreign_3d_net)
+            else None
         )
+        chip_t3_pf = (
+            float(trust_3d_net)
+            if trust_3d_net is not None and np.isfinite(trust_3d_net)
+            else None
+        )
+        bottom_pf = None
+        top_pf = None
+        try:
+            bottom_pf = run_turn_check(
+                df_turn,
+                mode="bottom",
+                cfg=turn_cfg,
+                foreign_3d_net=chip_f3_pf,
+                trust_3d_net=chip_t3_pf,
+            )
+            top_pf = run_turn_check(
+                df_turn,
+                mode="top",
+                cfg=turn_cfg,
+                foreign_3d_net=chip_f3_pf,
+                trust_3d_net=chip_t3_pf,
+            )
+        except Exception:
+            bottom_pf = None
+            top_pf = None
+        if str(turn_mode_default or "bottom").lower() == "top":
+            turn_result = top_pf if isinstance(top_pf, dict) else {}
+        else:
+            turn_result = bottom_pf if isinstance(bottom_pf, dict) else {}
+
+        _turn_b_str, _turn_b_sc = _portfolio_turn_display(bottom_pf, 4)
+        _turn_t_str, _turn_t_sc = _portfolio_turn_display(top_pf, 5)
 
         weighted_score, _, _ = compute_weighted_score(
             ema20=ema20,
@@ -2326,6 +2295,87 @@ elif page == "持股清單":
         if tp_high is not None and close_price is not None and not pd.isna(close_price):
             distance_to_tp_pct = ((tp_high - close_price) / close_price) * 100 if close_price != 0 else None
 
+        dec_res = None
+        pl_short = ""
+        pl_detail_md = ""
+        try:
+            df_sig = compute_buy_signals(df_hold.copy())
+            lr_sig = df_sig.iloc[-1]
+            _gp = bool(lr_sig.get("BUY_GATE", False))
+            _tp = bool(lr_sig.get("BUY_TRIGGER", False))
+            _gup = bool(lr_sig.get("EXEC_GUARD", True))
+            _trig_type = str(lr_sig.get("BUY_TRIGGER_TYPE", "NONE"))
+            _cp = (
+                float(close_price)
+                if close_price is not None and np.isfinite(close_price)
+                else 0.0
+            )
+            _upl_pct = (
+                float(upl_pct)
+                if upl_pct is not None and np.isfinite(upl_pct)
+                else None
+            )
+            _bs_pf = str((bottom_pf or {}).get("status", "NA"))
+            _ts_pf = str((top_pf or {}).get("status", "NA"))
+            if _bs_pf == "NA":
+                _bs_pf = None
+            if _ts_pf == "NA":
+                _ts_pf = None
+            dec_res = resolve_final_decision(
+                DecisionInput(
+                    close=_cp,
+                    ema5=float(ema5) if ema5 is not None and np.isfinite(ema5) else None,
+                    ema20=float(ema20) if ema20 is not None and np.isfinite(ema20) else None,
+                    defensive_line=float(ema5)
+                    if ema5 is not None and np.isfinite(ema5)
+                    else None,
+                    weighted_ai_score=float(weighted_score)
+                    if weighted_score is not None and np.isfinite(weighted_score)
+                    else None,
+                    bottom_status=_bs_pf,
+                    top_status=_ts_pf,
+                    exec_guard_ok=_gup,
+                    gate_pass=_gp,
+                    trigger_pass=_tp,
+                    guard_pass=_gup,
+                    pnl_pct=_upl_pct,
+                    position_mode=True,
+                )
+            )
+            _risk_pf = bool(latest_row.get("Is_Dangerous_Volume", False))
+            if precision is not None and getattr(precision, "level", "") == "danger":
+                _risk_pf = True
+            _has_pf = (
+                avg_cost is not None
+                and float(avg_cost) > 0
+            )
+            _narr_pf = PlainLanguageNarratorInput(
+                close=_cp,
+                ema5=float(ema5) if ema5 is not None and np.isfinite(ema5) else None,
+                ema20=float(ema20) if ema20 is not None and np.isfinite(ema20) else None,
+                gate_ok=_gp,
+                trigger_ok=_tp,
+                guard_ok=_gup,
+                trigger_type=_trig_type,
+                bottom_status=_bs_pf,
+                top_status=_ts_pf,
+                has_position=_has_pf,
+                risk_alert=_risk_pf,
+            )
+            _pls = build_plain_language_summary(dec_res, _narr_pf)
+            pl_short = _pls.one_line_verdict
+            pl_detail_md = (
+                f"**一句話** {_pls.one_line_verdict}\n\n"
+                f"**1. 現在是什麼狀態** {_pls.current_state}\n\n"
+                f"**2. 為什麼不是舒服買點** {_pls.why_not_buy}\n\n"
+                f"**3. 現在該做什麼** {_pls.action_now}\n\n"
+                f"**4. 看到什麼才改變看法** {_pls.what_to_wait_for}"
+            )
+        except Exception:
+            dec_res = None
+            pl_short = ""
+            pl_detail_md = ""
+
         rows.append(
             {
                 "股票": resolved_sym,
@@ -2352,8 +2402,21 @@ elif page == "持股清單":
                 "每張達標可賺": tp_profit_per_lot,
                 "距離達標%": distance_to_tp_pct,
                 "AI 分數": weighted_score,
+                "final_action": dec_res.action.value if dec_res else "",
+                "final_color": dec_res.color.value if dec_res else "",
+                "final_state": dec_res.state.value if dec_res else "",
+                "primary_reason": dec_res.primary_reason.value if dec_res else "",
+                "summary_title": dec_res.summary_title if dec_res else "",
+                "summary_text": dec_res.summary_text if dec_res else "",
+                "plain_summary_short": pl_short,
+                "TURN_bottom": _turn_b_str,
+                "TURN_top": _turn_t_str,
+                "TURN_bottom_score": _turn_b_sc,
+                "TURN_top_score": _turn_t_sc,
             }
         )
+        if pl_detail_md:
+            plain_full_by_symbol[resolved_sym] = pl_detail_md
 
     if rows:
         if bar is not None:
@@ -2379,9 +2442,25 @@ elif page == "持股清單":
         df_list = pd.DataFrame(rows)
         # 資料源偶發失敗時，可能會因為所有 df_hold 都是空而缺欄位，排序會 KeyError。
         # 先補齊關鍵欄位，確保排序/顯示穩定。
-        _text_defaults = {"TURN": "", "籌碼燈號": "", "籌碼行動": "", "籌碼診斷": ""}
+        _text_defaults = {
+            "TURN": "",
+            "籌碼燈號": "",
+            "籌碼行動": "",
+            "籌碼診斷": "",
+            "final_action": "",
+            "final_color": "",
+            "final_state": "",
+            "primary_reason": "",
+            "summary_title": "",
+            "summary_text": "",
+            "plain_summary_short": "",
+            "TURN_bottom": "",
+            "TURN_top": "",
+        }
         _num_defaults = [
             "TURN 分數",
+            "TURN_bottom_score",
+            "TURN_top_score",
             "AI 分數",
             "達標報酬%",
             "距離達標%",
@@ -2429,13 +2508,25 @@ elif page == "持股清單":
             df_list = df_list.drop(
                 columns=["_TURN_RANK", "_TURN_SCORE_NUM", "_AI_SCORE_NUM"]
             )
+        # 閱讀順序：先行動與白話，再雙 TURN，再側欄 TURN／AI 與細節
         preferred_order = [
             "股票",
             "名稱",
+            "final_action",
+            "plain_summary_short",
+            "TURN_bottom",
+            "TURN_top",
+            "TURN_bottom_score",
+            "TURN_top_score",
             "最佳",
             "TURN",
             "TURN 分數",
             "AI 分數",
+            "final_color",
+            "final_state",
+            "primary_reason",
+            "summary_title",
+            "summary_text",
             "籌碼燈號",
             "籌碼行動",
             "籌碼診斷",
@@ -2486,41 +2577,195 @@ elif page == "持股清單":
                 na_position="last",
             ).drop(columns=["_TURN_ORDER"])
 
+        _pf_n_before_filter = len(df_list)
+        df_show = df_list.copy()
+        with st.expander("盤前篩選（雙 TURN／行動）", expanded=False):
+            st.caption("條件為 AND；留空表示該項不篩。")
+            c_pf_a, c_pf_b = st.columns(2)
+            with c_pf_a:
+                _f_bottom = st.multiselect(
+                    "Bottom 狀態",
+                    ["ALLOW", "WATCH", "BLOCK"],
+                    default=[],
+                    key="portfolio_filter_bottom_status",
+                    help="依 TURN_bottom 字串開頭比對。",
+                )
+                _f_top = st.multiselect(
+                    "Top 狀態",
+                    ["ALLOW", "WATCH", "BLOCK"],
+                    default=[],
+                    key="portfolio_filter_top_status",
+                    help="依 TURN_top 字串開頭比對。",
+                )
+            with c_pf_b:
+                _f_action = st.multiselect(
+                    "final_action",
+                    ["HOLD", "WATCH", "REDUCE", "EXIT"],
+                    default=[],
+                    key="portfolio_filter_final_action",
+                )
+                _f_top_ge_watch = st.checkbox(
+                    "只看 Top 風險升溫（WATCH 或 BLOCK）",
+                    value=False,
+                    key="portfolio_filter_top_risk",
+                )
+            _f_bt_preset = st.checkbox(
+                "只看 Bottom 分數 ≥ 3 且 Top 分數 ≤ 1",
+                value=False,
+                key="portfolio_filter_bt_preset",
+            )
+            if _f_bottom and "TURN_bottom" in df_show.columns:
+                _m = pd.Series(False, index=df_show.index)
+                for _s in _f_bottom:
+                    _m |= df_show["TURN_bottom"].astype(str).str.startswith(
+                        _s, na=False
+                    )
+                df_show = df_show[_m]
+            if _f_top and "TURN_top" in df_show.columns:
+                _m = pd.Series(False, index=df_show.index)
+                for _s in _f_top:
+                    _m |= df_show["TURN_top"].astype(str).str.startswith(
+                        _s, na=False
+                    )
+                df_show = df_show[_m]
+            if _f_top_ge_watch and "TURN_top" in df_show.columns:
+                _ts = df_show["TURN_top"].astype(str)
+                df_show = df_show[
+                    _ts.str.startswith("WATCH", na=False)
+                    | _ts.str.startswith("BLOCK", na=False)
+                ]
+            if _f_bt_preset:
+                _bs = pd.to_numeric(
+                    df_show.get("TURN_bottom_score"), errors="coerce"
+                )
+                _tps = pd.to_numeric(
+                    df_show.get("TURN_top_score"), errors="coerce"
+                )
+                df_show = df_show[(_bs >= 3) & (_tps <= 1)]
+            if _f_action and "final_action" in df_show.columns:
+                df_show = df_show[df_show["final_action"].isin(_f_action)]
+
         money_cols = ["投入成本", "未實現損益", "達標可賺", "每張達標可賺"]
         pct_cols = ["未實現損益%", "達標報酬%", "距離達標%"]
         chip_pct_cols = ["土洋強弱比%", "法人參與度%"]
         chip_int_cols = ["法人合力3日(張)", "外資3日(張)", "投信3日(張)"]
 
         for c in money_cols:
-            if c in df_list.columns:
-                df_list[c] = df_list[c].map(
+            if c in df_show.columns:
+                df_show[c] = df_show[c].map(
                     lambda x: f"{x:,.0f}" if pd.notna(x) and x != "" else ""
                 )
 
         for c in pct_cols:
-            if c in df_list.columns:
-                df_list[c] = df_list[c].map(
+            if c in df_show.columns:
+                df_show[c] = df_show[c].map(
                     lambda x: f"{x:.1f}%" if pd.notna(x) and x != "" else ""
                 )
         for c in chip_pct_cols:
-            if c in df_list.columns:
-                df_list[c] = df_list[c].map(
+            if c in df_show.columns:
+                df_show[c] = df_show[c].map(
                     lambda x: f"{x:.1f}%" if pd.notna(x) and x != "" else ""
                 )
         for c in chip_int_cols:
-            if c in df_list.columns:
-                df_list[c] = df_list[c].map(
+            if c in df_show.columns:
+                df_show[c] = df_show[c].map(
                     lambda x: f"{x:+,.0f}" if pd.notna(x) and x != "" else ""
                 )
-        if "股數(股)" in df_list.columns:
-            df_list["股數(股)"] = pd.to_numeric(df_list["股數(股)"], errors="coerce")
+        if "股數(股)" in df_show.columns:
+            df_show["股數(股)"] = pd.to_numeric(df_show["股數(股)"], errors="coerce")
+
+        def _pf_style_turn_cell(val) -> str:
+            v = str(val).strip() if pd.notna(val) and val != "" else ""
+            if not v:
+                return ""
+            if v.startswith("ALLOW"):
+                return "background-color: #dcfce7; color: #14532d"
+            if v.startswith("WATCH"):
+                return "background-color: #fef9c3; color: #713f12"
+            if v.startswith("BLOCK"):
+                return "background-color: #fee2e2; color: #991b1b"
+            return ""
+
+        def _pf_style_action_cell(val) -> str:
+            v = str(val).strip() if pd.notna(val) and val != "" else ""
+            if v == "HOLD":
+                return "background-color: #dcfce7; color: #14532d"
+            if v == "WATCH":
+                return "background-color: #fef9c3; color: #713f12"
+            if v == "REDUCE":
+                return "background-color: #ffedd5; color: #9a3412"
+            if v == "EXIT":
+                return "background-color: #fee2e2; color: #991b1b"
+            return ""
+
+        def _portfolio_pf_style_frame(data: pd.DataFrame) -> pd.DataFrame:
+            out = pd.DataFrame("", index=data.index, columns=data.columns)
+            for col in ("TURN_bottom", "TURN_top"):
+                if col in data.columns:
+                    out[col] = data[col].map(_pf_style_turn_cell)
+            if "final_action" in data.columns:
+                out["final_action"] = data["final_action"].map(_pf_style_action_cell)
+            return out
+
         st.subheader("持股排序（目標差優先、分數次之）")
         st.caption("達標可賺 / 達標報酬% 為未扣手續費與交易稅的估算值")
-        st.dataframe(
-            df_list,
-            width="stretch",
-            hide_index=True,
+        st.caption(
+            f"目前顯示 **{len(df_show)}** / {_pf_n_before_filter} 檔。"
+            " **final_action**、**白話一句**、**TURN_bottom／top** 已套簡易底色（綠／黃／橘／紅）。"
         )
+        st.caption(
+            "「白話一句」與個股頁 **白話翻譯** 同源；**TURN_bottom / TURN_top** 為雙跑結果（狀態 分數/滿分）。"
+        )
+        _pf_col_cfg = {}
+        if "plain_summary_short" in df_show.columns:
+            _pf_col_cfg["plain_summary_short"] = st.column_config.TextColumn(
+                "白話一句",
+                help="掃描用短摘要（one_line_verdict）。完整四句請用下方 expander 選股展開。",
+            )
+        if "final_action" in df_show.columns:
+            _pf_col_cfg["final_action"] = st.column_config.TextColumn(
+                "final_action",
+                help="裁決行動：HOLD／WATCH／REDUCE／EXIT。",
+            )
+        if "TURN_bottom" in df_show.columns:
+            _pf_col_cfg["TURN_bottom"] = st.column_config.TextColumn(
+                "Bottom（進場面）",
+                help="bottom 模式：ALLOW/WATCH/BLOCK 與得分/4。",
+            )
+        if "TURN_top" in df_show.columns:
+            _pf_col_cfg["TURN_top"] = st.column_config.TextColumn(
+                "Top（風險面）",
+                help="top 模式：ALLOW/WATCH/BLOCK 與得分/5。",
+            )
+        _df_pf_kwargs: dict = {"width": "stretch", "hide_index": True}
+        if _pf_col_cfg:
+            _df_pf_kwargs["column_config"] = _pf_col_cfg
+        try:
+            _styler = df_show.style.apply(_portfolio_pf_style_frame, axis=None)
+            st.dataframe(_styler, **_df_pf_kwargs)
+        except Exception:
+            st.dataframe(df_show, **_df_pf_kwargs)
+        if plain_full_by_symbol:
+            with st.expander("白話全文（選股對照）", expanded=False):
+                st.caption(
+                    "與主控台個股頁 **白話翻譯** 同一套敘述；表格內僅顯示濃縮一句話。"
+                )
+                _sym_opts = (
+                    df_list["股票"].dropna().astype(str).tolist()
+                    if "股票" in df_list.columns
+                    else list(plain_full_by_symbol.keys())
+                )
+                if _sym_opts:
+                    _pick_pf = st.selectbox(
+                        "選擇股票",
+                        options=_sym_opts,
+                        key="portfolio_plain_detail_pick",
+                    )
+                    st.markdown(
+                        plain_full_by_symbol.get(
+                            _pick_pf, "_（此檔無白話全文）_"
+                        )
+                    )
     else:
         st.info("請先輸入至少一檔股票代碼。")
 
@@ -2531,6 +2776,10 @@ if df is None or df.empty:
     df = _load_data_raw(effective_symbol, time_range)
 
 if not df.empty:
+    page_resolved_decision = None
+    bottom_now_runtime = None
+    top_now_runtime = None
+
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [
             "_".join([str(x) for x in col if x is not None]) for col in df.columns
@@ -2640,6 +2889,10 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
     trigger_ok = bool(latest.get("BUY_TRIGGER", False))
     trigger_type = str(latest.get("BUY_TRIGGER_TYPE", "NONE"))
     exec_guard_ok = bool(latest.get("EXEC_GUARD", True))
+    narrative_buy_ok = bool(gate_ok and trigger_ok and exec_guard_ok)
+    entry_narrative_tier = resolve_entry_narrative_tier(
+        bool(gate_ok), bool(trigger_ok), bool(exec_guard_ok)
+    )
     exec_block_reason = str(latest.get("EXEC_BLOCK_REASON", "")).strip()
     buy_flag = bool(latest.get("BUY_SIGNAL", False))
     buy_note = str(latest.get("BUY_NOTE", "")).strip()
@@ -2666,6 +2919,14 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
         """,
         unsafe_allow_html=True,
     )
+    if entry_narrative_tier == EntryNarrativeTier.BUYABLE:
+        st.caption("進場敘述層：**可買**（Gate ∧ Trigger ∧ Guard 全過）。")
+    elif entry_narrative_tier == EntryNarrativeTier.OBSERVE_NO_BUY:
+        st.caption(
+            "進場敘述層：**可觀察，不可買**（Gate 通過，但 Trigger 或 Guard 未過）。"
+        )
+    else:
+        st.caption("進場敘述層：**不可買**（Gate 未過）。")
     if buy_note:
         st.info(f"買入訊號狀態：{buy_note}")
     if not exec_guard_ok:
@@ -2770,12 +3031,30 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
             prev_ema20 = to_scalar(ema_prev["EMA20"])
             golden_cross = prev_ema5 <= prev_ema20 and ema5 > ema20
             if crossed:
-                st.success("股價剛突破 EMA20，推薦買入")
-                st.balloons()
+                if narrative_buy_ok:
+                    st.success("股價剛突破 EMA20，推薦買入")
+                    st.balloons()
+                else:
+                    if entry_narrative_tier == EntryNarrativeTier.NO_BUY:
+                        st.warning(
+                            "股價突破 EMA20，但 **Gate 未過**—**不可買**；"
+                            "不視為程式建倉訊號。"
+                        )
+                    else:
+                        st.warning(
+                            "股價突破 EMA20，屬 **可觀察、不可買**（Trigger 或 Guard 未過）；"
+                            "不視為程式建倉訊號。"
+                        )
             elif close_price > ema20:
                 st.info("股價高於 EMA20")
                 st.write("短中線分水嶺：股價在 EMA20 之上，代表過去一個月買的人平均是賺錢的，屬於多頭強勢。")
-                st.write("策略解釋：黃金交叉/站上均線，推薦買入。")
+                if narrative_buy_ok:
+                    st.write("策略解釋：黃金交叉／站上均線，且風控門檻全過，才與建倉敘述一致。")
+                else:
+                    st.write(
+                        "策略解釋：價在 EMA20 上屬多方結構，但 **Gate／Trigger／Guard 未全過**，"
+                        "解釋層不得覆蓋風控—建倉請保守觀望。"
+                    )
             else:
                 st.info("股價低於 EMA20")
                 st.write("短中線分水嶺：股價在 EMA20 之下，代表短線趨勢偏弱，屬於空頭整理。")
@@ -2784,37 +3063,59 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
             # Strategy 區塊
             st.subheader("Strategy")
             if golden_cross:
-                st.success("偵測到黃金交叉，屬於多頭訊號")
-                if st.button("發送黃金交叉通知"):
-                    ok, msg = send_with_cooldown(
-                        f"{effective_symbol}_golden_cross",
-                        build_push_message("黃金交叉", "買入"),
-                        cooldown_minutes=60,
-                    )
-                    if ok:
-                        st.success("已傳送黃金交叉通知")
+                if narrative_buy_ok:
+                    st.success("偵測到黃金交叉，屬於多頭訊號（且風控門檻全過）")
+                    if st.button("發送黃金交叉通知"):
+                        ok, msg = send_with_cooldown(
+                            f"{effective_symbol}_golden_cross",
+                            build_push_message("黃金交叉", "買入"),
+                            cooldown_minutes=60,
+                        )
+                        if ok:
+                            st.success("已傳送黃金交叉通知")
+                        else:
+                            st.warning(msg)
+                else:
+                    if entry_narrative_tier == EntryNarrativeTier.NO_BUY:
+                        st.warning(
+                            "偵測到黃金交叉**型態**，但 **Gate 未過**—**不可買**；"
+                            "若持股請以 EMA5／裁決層為準。"
+                        )
                     else:
-                        st.warning(msg)
+                        st.warning(
+                            "偵測到黃金交叉**型態**，屬 **可觀察、不可買**（Trigger 或 Guard 未過）；"
+                            "若持股請以 EMA5／裁決層為準。"
+                        )
             if crossed and avg_vol_5 and current_vol > avg_vol_5 * 1.5:
                 st.info("交叉伴隨放量，訊號強度較高")
             if golden_cross and avg_vol_5 and current_vol > avg_vol_5 * 1.5:
-                st.success("黃金交叉伴隨放量，屬於強訊號")
-                if st.button("發送黃金交叉強訊號通知"):
-                    ok, msg = send_with_cooldown(
-                        f"{effective_symbol}_golden_cross_strong",
-                        build_push_message("黃金交叉強訊號", "買入"),
-                        cooldown_minutes=60,
-                    )
-                    if ok:
-                        st.success("已傳送強訊號通知")
+                if narrative_buy_ok:
+                    st.success("黃金交叉伴隨放量，屬於強訊號（且風控門檻全過）")
+                    if st.button("發送黃金交叉強訊號通知"):
+                        ok, msg = send_with_cooldown(
+                            f"{effective_symbol}_golden_cross_strong",
+                            build_push_message("黃金交叉強訊號", "買入"),
+                            cooldown_minutes=60,
+                        )
+                        if ok:
+                            st.success("已傳送強訊號通知")
+                        else:
+                            st.warning(msg)
+                else:
+                    if entry_narrative_tier == EntryNarrativeTier.NO_BUY:
+                        st.info(
+                            "放量＋黃金交叉型態，但 **Gate 未過**—**不可買**，不升級為強買入訊號。"
+                        )
                     else:
-                        st.warning(msg)
+                        st.info(
+                            "放量＋黃金交叉型態，屬 **可觀察、不可買**；不升級為強買入訊號。"
+                        )
         else:
             st.info("資料不足，無法判斷是否突破 EMA20")
     else:
         st.warning("EMA20 計算失敗，請檢查資料長度是否足夠（至少 20 天）")
 
-    # 4.1.1 去留診斷
+    # 4.1.1 去留／標的狀態（儀表條：有持股＝去留診斷，無持股＝標的狀態）
     is_high_volume_sell = False
     if ema20 is not None and ema5 is not None and not pd.isna(avg_vol_5):
         is_high_price = close_price > ema20 * 1.05
@@ -3052,6 +3353,142 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
     score = int(np.clip(weighted_score + context_score, 0, 100))
     reasons = weighted_reasons + context_reasons
 
+    # 頁面級 ResolvedDecision（頂部主結論卡與去留診斷共用，與下車指南同一套 TURN）
+    try:
+        chip_foreign_3d_page = (
+            float(foreign_net_series.dropna().tail(3).sum())
+            if foreign_net_series is not None
+            and foreign_net_series.dropna().shape[0] >= 3
+            else None
+        )
+        chip_trust_3d_page = (
+            float(trust_net_series.dropna().tail(3).sum())
+            if trust_net_series is not None and trust_net_series.dropna().shape[0] >= 3
+            else None
+        )
+        df_page_turn = df.copy()
+        if "RSI" not in df_page_turn.columns and "RSI14" in df_page_turn.columns:
+            df_page_turn["RSI"] = df_page_turn["RSI14"]
+        if foreign_net_series is not None and not foreign_net_series.empty:
+            df_page_turn["Foreign_Net"] = foreign_net_series.reindex(df_page_turn.index)
+        if trust_net_series is not None and not trust_net_series.empty:
+            df_page_turn["Trust_Net"] = trust_net_series.reindex(df_page_turn.index)
+        bottom_now_runtime = run_turn_check(
+            df_page_turn,
+            mode="bottom",
+            cfg=turn_cfg_runtime,
+            foreign_3d_net=chip_foreign_3d_page,
+            trust_3d_net=chip_trust_3d_page,
+        )
+        top_now_runtime = run_turn_check(
+            df_page_turn,
+            mode="top",
+            cfg=turn_cfg_runtime,
+            foreign_3d_net=chip_foreign_3d_page,
+            trust_3d_net=chip_trust_3d_page,
+        )
+    except Exception:
+        bottom_now_runtime = None
+        top_now_runtime = None
+
+    _safe_page = effective_symbol or "default"
+    _safe_page = "".join([c if c.isalnum() else "_" for c in _safe_page])
+    _key_avg_page = f"pos_avg_cost_{_safe_page}"
+    _key_qty_page = f"pos_qty_{_safe_page}"
+    _key_style_page = f"pos_exit_style_{_safe_page}"
+    pos_avg_page = float(st.session_state.get(_key_avg_page, 0.0) or 0.0)
+    pos_qty_page = int(st.session_state.get(_key_qty_page, 0) or 0)
+    pos_style_page = str(
+        st.session_state.get(_key_style_page, "波段守五日線") or "波段守五日線"
+    )
+    _def_page = ema20 if pos_style_page == "長線守月線" else ema5
+
+    if pos_avg_page > 0:
+        pa_page = get_position_advice(
+            current_price=close_price,
+            avg_cost=pos_avg_page,
+            qty=pos_qty_page,
+            ema_defense=_def_page,
+            bottom_result=bottom_now_runtime,
+            top_result=top_now_runtime,
+            ema5_short=ema5,
+            ema20_trend=ema20,
+            ai_score=weighted_score,
+            guard_ok=exec_guard_ok,
+            gate_pass=gate_ok,
+            trigger_pass=trigger_ok,
+            guard_pass=exec_guard_ok,
+        )
+        page_resolved_decision = getattr(pa_page, "resolution", None)
+    if page_resolved_decision is None and ema5 is not None:
+        page_resolved_decision = resolve_final_decision(
+            DecisionInput(
+                close=float(close_price),
+                ema5=float(ema5),
+                ema20=float(ema20)
+                if ema20 is not None and not pd.isna(ema20)
+                else None,
+                defensive_line=float(ema5),
+                weighted_ai_score=float(weighted_score),
+                bottom_status=str(bottom_now_runtime.get("status", "NA"))
+                if isinstance(bottom_now_runtime, dict)
+                else None,
+                top_status=str(top_now_runtime.get("status", "NA"))
+                if isinstance(top_now_runtime, dict)
+                else None,
+                exec_guard_ok=exec_guard_ok,
+                gate_pass=gate_ok,
+                trigger_pass=trigger_ok,
+                guard_pass=exec_guard_ok,
+                position_mode=False,
+            )
+        )
+
+    render_page_top_conclusion(
+        page_conclusion_placeholder,
+        page_resolved_decision,
+        symbol=effective_symbol or "",
+    )
+
+    _bt_stat = (
+        str(bottom_now_runtime.get("status", "NA"))
+        if isinstance(bottom_now_runtime, dict)
+        else "NA"
+    )
+    _tp_stat = (
+        str(top_now_runtime.get("status", "NA"))
+        if isinstance(top_now_runtime, dict)
+        else "NA"
+    )
+    narr_in = PlainLanguageNarratorInput(
+        close=float(close_price),
+        ema5=float(ema5) if ema5 is not None and not pd.isna(ema5) else None,
+        ema20=float(ema20) if ema20 is not None and not pd.isna(ema20) else None,
+        gate_ok=gate_ok,
+        trigger_ok=trigger_ok,
+        guard_ok=bool(exec_guard_ok),
+        trigger_type=str(trigger_type),
+        bottom_status=_bt_stat if _bt_stat != "NA" else None,
+        top_status=_tp_stat if _tp_stat != "NA" else None,
+        has_position=pos_avg_page > 0,
+        risk_alert=bool(latest.get("Is_Dangerous_Volume", False))
+        or bool(foreign_divergence_warning),
+    )
+    pl_summary = build_plain_language_summary(page_resolved_decision, narr_in)
+    dip_verdict = can_buy_the_dip(
+        close=float(close_price),
+        ema5=narr_in.ema5,
+        trigger_type=str(trigger_type),
+        guard_ok=bool(exec_guard_ok),
+        risk_alert=narr_in.risk_alert,
+        near_support_red_bar=narr_in.near_support_red_bar,
+    )
+    render_plain_language_block(
+        plain_language_placeholder,
+        pl_summary,
+        dip_verdict,
+    )
+
     # --- Dashboard 顯示區塊 ---
     with dashboard_placeholder.container():
         st.divider()
@@ -3249,254 +3686,21 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
             chip_divergence=foreign_divergence_warning,
         )
 
-        used_map = {"Gate": [], "Trigger": [], "Guard": [], "Chip Notes": []}
-        used_map["Gate"].append(
-            rule_item(
-                key="BUY_GATE",
-                rule="Gate 通過（趨勢 + 風險門檻）",
-                value=bool(latest.get("BUY_GATE", False)),
-                threshold="BUY_GATE == True",
-                passed=bool(latest.get("BUY_GATE", False)),
-                note="trend_ok: Close>SMA20 & SMA20上升；risk_ok: Vol<=1.5*VolMA20 & |Bias20|<=10",
-            )
+        used_map = build_used_map_for_signals(
+            df,
+            latest,
+            close_price=close_price,
+            prev_close=prev_close,
+            bias_20_val=bias_20_val,
+            sma20_val=sma20_val,
+            latest_volume=latest_volume,
+            vol_ma20_val=vol_ma20_val,
+            trigger_type=trigger_type,
+            foreign_divergence_warning=foreign_divergence_warning,
+            foreign_net_latest=foreign_net_latest,
+            foreign_3d_net=foreign_3d_net,
+            trust_3d_net=trust_3d_net,
         )
-        used_map["Trigger"].append(
-            rule_item(
-                key="BUY_TRIGGER",
-                rule="Trigger 通過（PULLBACK/BREAKOUT/CONTINUATION）",
-                value=str(latest.get("BUY_TRIGGER_TYPE", "NONE")),
-                threshold="BUY_TRIGGER == True",
-                passed=bool(latest.get("BUY_TRIGGER", False)),
-                note="TriggerType = BUY_TRIGGER_TYPE",
-            )
-        )
-        used_map["Guard"].append(
-            rule_item(
-                key="EXEC_GUARD",
-                rule="Execution Guard 通過（防假突破/過熱/失守 AVWAP）",
-                value=bool(latest.get("EXEC_GUARD", True)),
-                threshold="EXEC_GUARD == True",
-                passed=bool(latest.get("EXEC_GUARD", True)),
-                note=str(latest.get("EXEC_BLOCK_REASON", "")).strip(),
-            )
-        )
-        used_map["Chip Notes"].append(
-            rule_item(
-                key="chip_divergence",
-                rule="籌碼背離（價漲但外資連賣）",
-                value=bool(foreign_divergence_warning),
-                threshold="False（理想狀態）",
-                passed=not bool(foreign_divergence_warning),
-                note="若為 True：建議 Gate/Trigger 降級或提高停損嚴格度",
-            )
-        )
-        used_map["Gate"].append(
-            rule_item(
-                key="SMA20",
-                rule="收盤 > SMA20",
-                value=close_price,
-                threshold="Close > SMA20",
-                passed=bool(close_price > sma20_val) if sma20_val is not None else False,
-            )
-        )
-        used_map["Gate"].append(
-            rule_item(
-                key="SMA20_up",
-                rule="SMA20 走升（SMA20 > SMA20.shift(5)）",
-                value=float(sma20_val) if sma20_val is not None and not pd.isna(sma20_val) else None,
-                threshold="SMA20 > SMA20(5日前)",
-                passed=bool(df["SMA20"].iloc[-1] > df["SMA20"].shift(5).iloc[-1])
-                if len(df) >= 6 and not pd.isna(df["SMA20"].shift(5).iloc[-1])
-                else False,
-                note="趨勢門檻",
-            )
-        )
-        used_map["Gate"].append(
-            rule_item(
-                key="Bias20_gate",
-                rule="|SMA20乖離| <= 10（避免追高/過熱）",
-                value=float(bias_20_val) if bias_20_val is not None and not pd.isna(bias_20_val) else None,
-                threshold="abs(Bias20) <= 10",
-                passed=bool(abs(bias_20_val) <= 10)
-                if bias_20_val is not None and not pd.isna(bias_20_val)
-                else False,
-                note="風險門檻",
-            )
-        )
-        used_map["Gate"].append(
-            rule_item(
-                key="Volume_gate",
-                rule="Volume <= 1.5×VolMA20（避免爆量失控）",
-                value=float(latest_volume) if latest_volume is not None and not pd.isna(latest_volume) else None,
-                threshold="Volume <= 1.5×VolMA20",
-                passed=bool(latest_volume <= 1.5 * vol_ma20_val)
-                if (latest_volume is not None and vol_ma20_val is not None and not pd.isna(vol_ma20_val))
-                else False,
-                note="風險門檻",
-            )
-        )
-
-        trigger_pullback_pass = (
-            bool(trigger_type == "PULLBACK" and (-1 <= bias_20_val <= 3) and (close_price > prev_close))
-            if (prev_close is not None and bias_20_val is not None and not pd.isna(bias_20_val))
-            else False
-        )
-        hhv20_prev = to_scalar(df["High"].rolling(20, min_periods=20).max().shift(1).iloc[-1]) if len(df) >= 21 else np.nan
-        trigger_breakout_pass = bool(
-            trigger_type == "BREAKOUT"
-            and (close_price is not None and not pd.isna(hhv20_prev) and close_price > hhv20_prev)
-            and (latest_volume is not None and vol_ma20_val is not None and not pd.isna(vol_ma20_val) and latest_volume > 1.2 * vol_ma20_val)
-        )
-        hhv5_prev = to_scalar(df["High"].rolling(5, min_periods=5).max().shift(1).iloc[-1]) if len(df) >= 6 else np.nan
-        trigger_cont_pass = bool(
-            trigger_type == "CONTINUATION"
-            and (bias_20_val is not None and not pd.isna(bias_20_val) and 3 <= bias_20_val <= 10)
-            and (close_price is not None and not pd.isna(hhv5_prev) and close_price > hhv5_prev)
-        )
-
-        used_map["Trigger"].append(
-            rule_item(
-                key="Trigger_type",
-                rule="Trigger 類型",
-                value=trigger_type,
-                threshold="PULLBACK/BREAKOUT/CONTINUATION",
-                passed=bool(trigger_ok),
-                note="trigger_ok = True 才算點火",
-            )
-        )
-        used_map["Trigger"].append(
-            rule_item(
-                key="Trigger_pullback",
-                rule="回踩買：Bias20 -1~+3 且 Close > 昨收",
-                value=f"Bias20={bias_20_val:.2f}, Close={close_price:.2f}, Prev={prev_close:.2f}"
-                if (bias_20_val is not None and prev_close is not None and close_price is not None and not pd.isna(bias_20_val))
-                else None,
-                threshold="(-1<=Bias20<=3) & (Close>PrevClose)",
-                passed=trigger_pullback_pass,
-            )
-        )
-        used_map["Trigger"].append(
-            rule_item(
-                key="Trigger_breakout",
-                rule="突破買：Close > 前 20 日高 & Volume > 1.2×VolMA20",
-                value=f"Close={close_price:.2f}, HHV20_prev={hhv20_prev:.2f}, Vol={int(latest_volume):,}, VolMA20={int(vol_ma20_val):,}"
-                if (close_price is not None and not pd.isna(hhv20_prev) and latest_volume is not None and vol_ma20_val is not None and not pd.isna(vol_ma20_val))
-                else None,
-                threshold="Close>HHV20.shift(1) & Vol>1.2×VolMA20",
-                passed=trigger_breakout_pass,
-            )
-        )
-        used_map["Trigger"].append(
-            rule_item(
-                key="Trigger_continuation",
-                rule="延續買：Bias20 3~10 且 Close > 前 5 日高",
-                value=f"Bias20={bias_20_val:.2f}, Close={close_price:.2f}, HHV5_prev={hhv5_prev:.2f}"
-                if (bias_20_val is not None and close_price is not None and not pd.isna(hhv5_prev) and not pd.isna(bias_20_val))
-                else None,
-                threshold="(3<=Bias20<=10) & (Close>HHV5.shift(1))",
-                passed=trigger_cont_pass,
-            )
-        )
-
-        k_range_latest = float((latest["High"] - latest["Low"])) if ("High" in latest and "Low" in latest and (latest["High"] - latest["Low"]) != 0) else np.nan
-        close_pos_latest = float((latest["Close"] - latest["Low"]) / k_range_latest) if (not pd.isna(k_range_latest)) else np.nan
-        vol_ratio_20_latest = float(latest_volume / vol_ma20_val) if (latest_volume is not None and vol_ma20_val is not None and not pd.isna(vol_ma20_val) and vol_ma20_val != 0) else np.nan
-        avwap_val = to_scalar(latest.get("AVWAP", np.nan))
-
-        breakout_close_strong_pass = bool(close_pos_latest >= 0.6) if not pd.isna(close_pos_latest) else False
-        not_crazy_volume_pass = bool(vol_ratio_20_latest <= 2.0) if not pd.isna(vol_ratio_20_latest) else False
-        not_too_hot_pass = bool(bias_20_val <= 9.5) if (bias_20_val is not None and not pd.isna(bias_20_val)) else False
-        avwap_support_pass = bool(pd.isna(avwap_val) or close_price >= avwap_val) if (close_price is not None) else False
-
-        is_strict_guard = trigger_type in ["BREAKOUT", "CONTINUATION"]
-
-        used_map["Guard"].append(
-            rule_item(
-                key="Guard_strict_mode",
-                rule="Guard 嚴格模式（BREAKOUT/CONTINUATION 才啟用）",
-                value=trigger_type,
-                threshold="Trigger in {BREAKOUT, CONTINUATION}",
-                passed=is_strict_guard,
-                note="Pullback 不走嚴格檢查",
-            )
-        )
-        used_map["Guard"].append(
-            rule_item(
-                key="Guard_close_strong",
-                rule="收盤位置要強（Close_pos >= 0.6）",
-                value=float(close_pos_latest) if not pd.isna(close_pos_latest) else None,
-                threshold=">= 0.6",
-                passed=(breakout_close_strong_pass if is_strict_guard else True),
-            )
-        )
-        used_map["Guard"].append(
-            rule_item(
-                key="Guard_vol_not_crazy",
-                rule="量能不失控（Vol/VolMA20 <= 2.0）",
-                value=float(vol_ratio_20_latest) if not pd.isna(vol_ratio_20_latest) else None,
-                threshold="<= 2.0",
-                passed=(not_crazy_volume_pass if is_strict_guard else True),
-            )
-        )
-        used_map["Guard"].append(
-            rule_item(
-                key="Guard_not_too_hot",
-                rule="乖離不貼近上限（Bias20 <= 9.5）",
-                value=float(bias_20_val) if bias_20_val is not None and not pd.isna(bias_20_val) else None,
-                threshold="<= 9.5",
-                passed=(not_too_hot_pass if is_strict_guard else True),
-            )
-        )
-        used_map["Guard"].append(
-            rule_item(
-                key="Guard_avwap_support",
-                rule="成本線（AVWAP）不失守（Close >= AVWAP or AVWAP is NA）",
-                value=float(avwap_val) if (avwap_val is not None and not pd.isna(avwap_val)) else "NA",
-                threshold="Close >= AVWAP",
-                passed=avwap_support_pass,
-            )
-        )
-
-        used_map["Chip Notes"].append(
-            rule_item(
-                key="chip_divergence",
-                rule="籌碼背離（股價上漲但外資近 3 日連賣）",
-                value="True" if foreign_divergence_warning else "False",
-                threshold="foreign_divergence_warning == False",
-                passed=(not foreign_divergence_warning),
-                note="若 True，Gate 可能降級為 WATCH",
-            )
-        )
-        if foreign_net_latest is not None:
-            used_map["Chip Notes"].append(
-                rule_item(
-                    key="foreign_net_latest",
-                    rule="外資單日買賣超",
-                    value=float(foreign_net_latest),
-                    threshold="> 0（偏多）",
-                    passed=bool(foreign_net_latest > 0),
-                )
-            )
-        if foreign_3d_net is not None:
-            used_map["Chip Notes"].append(
-                rule_item(
-                    key="foreign_3d_net",
-                    rule="外資 3 日累計買賣超",
-                    value=float(foreign_3d_net),
-                    threshold=">= 0（籌碼未散）",
-                    passed=bool(foreign_3d_net >= 0),
-                )
-            )
-        if trust_3d_net is not None:
-            used_map["Chip Notes"].append(
-                rule_item(
-                    key="trust_3d_net",
-                    rule="投信 3 日累計買賣超",
-                    value=float(trust_3d_net),
-                    threshold="> 0（偏多）",
-                    passed=bool(trust_3d_net > 0),
-                )
-            )
 
         _safe_symbol = "".join([c if c.isalnum() else "_" for c in (effective_symbol or "default")])
         _has_pos = float(st.session_state.get(f"pos_avg_cost_{_safe_symbol}", 0) or 0) > 0
@@ -3763,33 +3967,37 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
         )
 
         with st.expander("🏁 下車指南（白話文決策）", expanded=True):
-            try:
-                df_turn_advice = df.copy()
-                if "RSI" not in df_turn_advice.columns and "RSI14" in df_turn_advice.columns:
-                    df_turn_advice["RSI"] = df_turn_advice["RSI14"]
-                if foreign_net_series is not None and not foreign_net_series.empty:
-                    df_turn_advice["Foreign_Net"] = foreign_net_series.reindex(df_turn_advice.index)
-                if trust_net_series is not None and not trust_net_series.empty:
-                    df_turn_advice["Trust_Net"] = trust_net_series.reindex(df_turn_advice.index)
+            df_turn_advice = df.copy()
+            if "RSI" not in df_turn_advice.columns and "RSI14" in df_turn_advice.columns:
+                df_turn_advice["RSI"] = df_turn_advice["RSI14"]
+            if foreign_net_series is not None and not foreign_net_series.empty:
+                df_turn_advice["Foreign_Net"] = foreign_net_series.reindex(df_turn_advice.index)
+            if trust_net_series is not None and not trust_net_series.empty:
+                df_turn_advice["Trust_Net"] = trust_net_series.reindex(df_turn_advice.index)
 
-                top_now = run_turn_check(
-                    df_turn_advice,
-                    mode="top",
-                    cfg=turn_cfg_runtime,
-                    foreign_3d_net=chip_foreign_3d_net,
-                    trust_3d_net=chip_trust_3d_net,
-                )
-                bottom_now = run_turn_check(
-                    df_turn_advice,
-                    mode="bottom",
-                    cfg=turn_cfg_runtime,
-                    foreign_3d_net=chip_foreign_3d_net,
-                    trust_3d_net=chip_trust_3d_net,
-                )
-            except Exception:
-                df_turn_advice = df
-                top_now = None
-                bottom_now = None
+            if bottom_now_runtime is not None and top_now_runtime is not None:
+                bottom_now = bottom_now_runtime
+                top_now = top_now_runtime
+            else:
+                try:
+                    top_now = run_turn_check(
+                        df_turn_advice,
+                        mode="top",
+                        cfg=turn_cfg_runtime,
+                        foreign_3d_net=chip_foreign_3d_net,
+                        trust_3d_net=chip_trust_3d_net,
+                    )
+                    bottom_now = run_turn_check(
+                        df_turn_advice,
+                        mode="bottom",
+                        cfg=turn_cfg_runtime,
+                        foreign_3d_net=chip_foreign_3d_net,
+                        trust_3d_net=chip_trust_3d_net,
+                    )
+                except Exception:
+                    df_turn_advice = df
+                    top_now = None
+                    bottom_now = None
 
             # 持倉建議（供去留診斷與持倉區塊一致）
             _defense = ema20 if str(pos_exit_style) == "長線守月線" else ema5
@@ -3800,6 +4008,13 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
                 ema_defense=_defense,
                 bottom_result=bottom_now,
                 top_result=top_now,
+                ema5_short=ema5,
+                ema20_trend=ema20,
+                ai_score=weighted_score,
+                guard_ok=exec_guard_ok,
+                gate_pass=gate_ok,
+                trigger_pass=trigger_ok,
+                guard_pass=exec_guard_ok,
             )
 
             _trail = float(turn_bt_trailing_stop or 0.0)
@@ -3814,6 +4029,8 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
                 trailing_stop_pct=_trail if _trail > 0 else 10.0,
                 foreign_net_series=foreign_net_series,
                 trust_net_series=trust_net_series,
+                ai_score=float(weighted_score),
+                exec_guard_ok=bool(exec_guard_ok),
             )
 
         st.markdown("### 圖表設定")
@@ -5050,8 +5267,23 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
         render_conflict_warning(
             foreign_divergence_warning, bool(latest.get("Is_Dangerous_Volume", False))
         )
+        _expert_bottom = "NA"
+        if isinstance(turn_result, dict):
+            if turn_result.get("mode") == "both" and isinstance(
+                turn_result.get("bottom"), dict
+            ):
+                _expert_bottom = str(turn_result["bottom"].get("status", "NA"))
+            elif str(turn_result.get("mode", "")) == "bottom":
+                _expert_bottom = str(turn_result.get("status", "NA"))
+
         expert_msg = generate_expert_advice(
-            df, name, score, risk, is_chip_divergence=foreign_divergence_warning
+            df,
+            name,
+            score,
+            risk,
+            is_chip_divergence=foreign_divergence_warning,
+            weighted_ai_score=weighted_score,
+            bottom_status=_expert_bottom,
         )
         if latest.get("BUY_SIGNAL"):
             st.success(expert_msg)
@@ -5059,38 +5291,70 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
             st.info(expert_msg)
         st.caption("分數門檻：≥70 留、40~69 減碼、<40 去")
 
-        # 持倉模式：以持倉診斷為準，避免與「安心抱/分批減碼」矛盾
+        # 與頂卡同一套 ResolvedDecision；標題／句型依是否持股切換（去留 vs 標的狀態）
         pos_cost = float(locals().get("pos_avg_cost", 0) or 0)
-        if pos_cost > 0 and "pos_advice" in locals():
-            pa = locals()["pos_advice"]
-            if pa.level == "error" or ("減碼" in pa.headline or "落袋" in pa.headline):
-                diagnosis_summary.warning("去留診斷：建議分批減碼")
-            elif pa.level == "warning":
-                diagnosis_summary.warning("去留診斷：減碼觀望")
-            elif pa.level == "success":
-                diagnosis_summary.success("去留診斷：持股續抱")
+        has_pos = pos_cost > 0
+        rdc = locals().get("page_resolved_decision")
+
+        def _emit_diagnosis_strip(d: ResolvedDecision, has_position: bool) -> None:
+            t = get_status_bar_title(has_position)
+            lab = get_status_bar_label(d, has_position)
+            msg = f"{t}：{lab}"
+            if d.action == FinalAction.EXIT:
+                diagnosis_summary.error(msg)
+            elif d.action in (FinalAction.WATCH, FinalAction.REDUCE):
+                diagnosis_summary.warning(msg)
+            elif d.action == FinalAction.HOLD:
+                diagnosis_summary.success(msg)
             else:
-                diagnosis_summary.info("去留診斷：續抱/觀察")
-        elif score >= 70:
-            diagnosis_summary.success("去留診斷：持股續抱")
-        elif score >= 40:
-            diagnosis_summary.warning("去留診斷：減碼觀望")
+                diagnosis_summary.info(msg)
+
+        if rdc is not None:
+            _emit_diagnosis_strip(rdc, has_pos)
+        elif has_pos and "pos_advice" in locals():
+            pa = locals()["pos_advice"]
+            rdc2 = getattr(pa, "resolution", None)
+            t = get_status_bar_title(True)
+            if rdc2 is not None:
+                _emit_diagnosis_strip(rdc2, True)
+            elif pa.level == "error" or ("減碼" in pa.headline or "落袋" in pa.headline):
+                diagnosis_summary.warning(f"{t}：減碼觀望")
+            elif pa.level == "warning":
+                diagnosis_summary.warning(f"{t}：減碼觀望")
+            elif pa.level == "success":
+                diagnosis_summary.success(f"{t}：持股續抱")
+            else:
+                diagnosis_summary.info(f"{t}：續抱/觀察")
         else:
-            diagnosis_summary.error("去留診斷：考慮離場")
+            t = get_status_bar_title(has_pos)
+            lab = get_status_bar_label_for_score(score, has_pos)
+            msg = f"{t}：{lab}"
+            if score >= 70:
+                diagnosis_summary.success(msg)
+            elif score >= 40:
+                diagnosis_summary.warning(msg)
+            else:
+                diagnosis_summary.error(msg)
+        _line_push_mode = st.radio(
+            "LINE 推播範圍",
+            ["完整", "精簡"],
+            horizontal=True,
+            key="line_diagnosis_push_mode",
+            help="精簡：結論＋TURN／防守濃縮＋風險最多 2 條，不含專家長文。完整：含防守細節、風險明細、專家診斷。",
+        )
+        _line_compact = _line_push_mode == "精簡"
         if st.button("一鍵傳送完整診斷到 LINE"):
             try:
-                if pos_cost > 0 and "pos_advice" in locals():
-                    pa = locals()["pos_advice"]
-                    if pa.level == "error" or ("減碼" in pa.headline or "落袋" in pa.headline):
-                        decision_text = "建議分批減碼"
-                    elif pa.level == "warning":
-                        decision_text = "減碼觀望"
-                    elif pa.level == "success":
-                        decision_text = "續抱"
-                    else:
-                        decision_text = "續抱/觀察"
-                else:
-                    decision_text = "續抱" if score >= 70 else "減碼觀望" if score >= 40 else "考慮離場"
+                _rdc = locals().get("page_resolved_decision")
+                if _rdc is None and pos_cost > 0 and "pos_advice" in locals():
+                    _rdc = getattr(locals()["pos_advice"], "resolution", None)
+                _pls_ln = locals().get("pl_summary")
+                _sum_fb = ""
+                if _pls_ln is not None:
+                    _sum_fb = (
+                        (_pls_ln.what_to_wait_for or "").strip()
+                        or (_pls_ln.current_state or "").strip()
+                    )
 
                 # 防守線：依使用者下車風格（若取不到就用 EMA5）
                 _exit_style = str(locals().get("pos_exit_style", "") or "")
@@ -5102,58 +5366,50 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
                     buffer_pct=1.5,
                 )
 
-                # TURN（若可取得）
                 _bottom_now = locals().get("bottom_now")
                 _top_now = locals().get("top_now")
-                bottom_txt = (
-                    f"{_bottom_now.get('status')} {int(_bottom_now.get('score', 0))}/4"
-                    if isinstance(_bottom_now, dict)
-                    else "NA"
-                )
-                top_txt = (
-                    f"{_top_now.get('status')} {int(_top_now.get('score', 0))}/5"
-                    if isinstance(_top_now, dict)
-                    else "NA"
-                )
 
-                # 風險警報（只列 FAIL，最多 5 條）
-                fail_lines = []
-                for cat in ["Gate", "Trigger", "Guard", "Chip Notes"]:
-                    for it in (used_map or {}).get(cat, []) or []:
-                        if it.get("pass", True) is False:
-                            rule = str(it.get("rule", "") or "").strip()
-                            note = str(it.get("note", "") or "").strip()
-                            fail_lines.append(f"- {cat}｜{rule}{('｜' + note) if note else ''}")
-                        if len(fail_lines) >= 5:
-                            break
-                    if len(fail_lines) >= 5:
-                        break
+                fail_lines = build_fail_lines_from_used_map(used_map, max_lines=5)
+                _short_max = COMPACT_SHORT_RISK_MAX if _line_compact else 5
+                fail_lines_short = build_fail_lines_short_from_used_map(
+                    used_map, max_lines=_short_max
+                )
+                _primary_risk_cat = get_primary_risk_category(used_map)
 
-                msg_lines = []
-                msg_lines.append(f"【{ticker} 完整診斷】")
-                if name:
-                    msg_lines.append(f"名稱：{name}")
-                msg_lines.append(f"收盤：{close_price:.2f}")
-                msg_lines.append(f"AI 分數：{score}｜建議：{decision_text}")
-                msg_lines.append(f"TURN bottom：{bottom_txt}｜TURN top：{top_txt}")
-                if guard is not None:
-                    msg_lines.append(
-                        f"明日保命價：{guard.break_close:.2f}｜保守警戒(+{guard.buffer_pct:.1f}%) {guard.guard_close:.2f}"
-                    )
-                    msg_lines.append(f"防守線：{_defense_name}={guard.ema_today:.2f}")
-                if fail_lines:
-                    msg_lines.append("⚠️ 風險警報（FAIL）：")
-                    msg_lines.extend(fail_lines)
-                msg_lines.append("---")
-                msg_lines.append(expert_msg)
+                _payload = build_line_push_payload(
+                    mode="compact" if _line_compact else "full",
+                    ticker=str(ticker),
+                    name=str(name or ""),
+                    close_price=float(close_price),
+                    score=int(score),
+                    has_position=bool(has_pos),
+                    decision=_rdc,
+                    one_line_verdict=(
+                        (_pls_ln.one_line_verdict or "").strip() if _pls_ln else ""
+                    ),
+                    summary_fallback=_sum_fb,
+                    bottom_now=_bottom_now,
+                    top_now=_top_now,
+                    guard=guard,
+                    defense_name=_defense_name,
+                    fail_lines=fail_lines,
+                    fail_lines_short=fail_lines_short,
+                    expert_msg=str(expert_msg or ""),
+                    merge_primary_risk_into_verdict=True,
+                    primary_risk_category=_primary_risk_cat,
+                    merge_primary_risk_show_category=True,
+                )
 
                 ok, msg = send_with_cooldown(
-                    f"{effective_symbol}_full_diagnosis",
-                    "\n".join(msg_lines),
+                    f"{effective_symbol}_full_diagnosis_{'c' if _line_compact else 'f'}",
+                    _payload,
                     cooldown_minutes=5,
                 )
                 if ok:
-                    st.success("已推播完整診斷到 LINE")
+                    _sym = str(effective_symbol or ticker or "").strip()
+                    st.success(
+                        f"已推播（{'精簡' if _line_compact else '完整'}）｜{_sym}"
+                    )
                 else:
                     st.warning(msg)
             except Exception as exc:
