@@ -11,6 +11,7 @@ LINE 推播：精簡／完整尾段與總長度保護（與頁面結論同源的
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Literal, Optional
 
 from final_decision_resolver import (
@@ -34,7 +35,7 @@ COMPACT_SHORT_RISK_MAX = 2
 PRIMARY_RISK_CATEGORY_SHORT_LABEL: Dict[str, str] = {
     "Guard": "防守",
     "Gate": "結構",
-    "Trigger": "動能",
+    "Trigger": "上漲力道",
     "Chip Notes": "籌碼",
 }
 
@@ -238,6 +239,70 @@ def strip_markdown_for_line_push(text: str) -> str:
     return (text or "").replace("**", "").strip()
 
 
+def strip_redundant_stock_name_from_line_expert_text(text: str, name: str) -> str:
+    """
+    LINE 一般版「專家診斷」：主結論標題已含股名時，刪除講評內重複的同一顯示名稱，
+    例如「觀望保守：ChipMOS TECHNOLOGIES INC. 評分 44」→「觀望保守：評分 44」。
+    僅處理「：／:」後緊接完整名稱再接後文之典型句式，避免誤傷他處字串。
+    """
+    s = (text or "").strip()
+    n = (name or "").strip()
+    if len(n) < 2 or n not in s:
+        return s
+    esc = re.escape(n)
+    s = re.sub(rf"([：:])\s*{esc}\s+", r"\1", s)
+    while "：：" in s:
+        s = s.replace("：：", "：")
+    while "  " in s:
+        s = s.replace("  ", " ")
+    return s.strip()
+
+
+def scrub_line_push_engineering_terms(text: str) -> str:
+    """
+    一般版 LINE：將殘留工程語改為人話（下車指南／專家段皆可套）。
+    僅替換已知片語，避免誤傷公司名等；改規則集中在此。
+    """
+    if not (text or "").strip():
+        return (text or "").strip()
+    s = text
+    pairs = [
+        ("top 轉弱/過熱", "漲多轉弱"),
+        ("top 風險升溫", "高檔風險升溫"),
+        ("top 風險", "高檔風險"),
+        ("top 轉弱", "漲多轉弱"),
+        ("+ top 轉弱", "漲多轉弱"),
+        (" + top 轉弱", "漲多轉弱"),
+        ("且 top 風險升溫", "且高檔風險升溫"),
+        ("且 top ", "且高檔"),
+        ("bottom 分數不足", "進場訊號偏弱"),
+        ("Profit >", "獲利逾"),
+        ("TURN ", ""),
+        (" TURN", ""),
+    ]
+    for a, b in pairs:
+        s = s.replace(a, b)
+    for token in (
+        "[STRUCTURE]",
+        "[PRICE]",
+        "[GUARD]",
+        "[RISK]",
+        "[AI]",
+        "[BUY]",
+    ):
+        s = s.replace(token, "")
+    s = s.replace("bottom =", "進場=").replace("top =", "高檔=")
+    s = re.sub(r"\bALLOW\b", "綠燈", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bWATCH\b", "黃燈", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bBLOCK\b", "紅燈", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bTrigger\b", "點火條件", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bGuard\b", "執行保護", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bGate\b", "進場門檻", s, flags=re.IGNORECASE)
+    while "  " in s:
+        s = s.replace("  ", " ")
+    return s.strip()
+
+
 def _finite_pct(x: Any) -> bool:
     try:
         v = float(x)
@@ -253,17 +318,17 @@ def normalize_entry_reason(reason_key: str) -> str:
     """
     mapping = {
         # BLOCK
-        "gate_fail": "未過關",
+        "gate_fail": "進場條件不足",
         "overheat": "過熱",
         "volume_spike": "爆量",
         # WATCH（Guard 未過 → 不寫工程詞「護欄」）
         "guard_fail": "風險偏高",
-        "trigger_fail": "動能不足",
+        "trigger_fail": "上漲力道不足",
         "watch_fallback": "條件未到",
         # ALLOW
         "allow_pullback": "回檔",
         "allow_breakout": "突破",
-        "allow_continuation": "動能延續",
+        "allow_continuation": "漲勢延續",
         "allow_default": "條件到位",
     }
     k = (reason_key or "").strip()
@@ -412,19 +477,26 @@ def build_line_push_reader_plain(
         bias20_pct=entry_bias20_pct,
         volume_spike=bool(entry_volume_spike),
     )
-    exit_txt = build_exit_guide_push_text(
-        close_last=float(close_price),
-        avg_cost=float(avg_cost or 0.0),
-        exit_style=str(exit_style or "波段守五日線"),
-        ema5=ema5,
-        ema20=ema20,
-        bottom_result=bottom_result,
-        top_result=top_result,
-        turn_result=turn_result,
-        advice=position_advice,
-        section_heading=READER_LINE_HEADING_EXIT,
+    exit_txt = scrub_line_push_engineering_terms(
+        build_exit_guide_push_text(
+            close_last=float(close_price),
+            avg_cost=float(avg_cost or 0.0),
+            exit_style=str(exit_style or "波段守五日線"),
+            ema5=ema5,
+            ema20=ema20,
+            bottom_result=bottom_result,
+            top_result=top_result,
+            turn_result=turn_result,
+            advice=position_advice,
+            section_heading=READER_LINE_HEADING_EXIT,
+        )
     )
-    expert_plain = strip_markdown_for_line_push(expert_msg)
+    expert_plain = strip_redundant_stock_name_from_line_expert_text(
+        scrub_line_push_engineering_terms(
+            strip_markdown_for_line_push(expert_msg)
+        ),
+        name=str(name or "").strip(),
+    )
     body = "\n".join(
         [
             main,

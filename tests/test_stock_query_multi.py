@@ -60,7 +60,7 @@ def test_run_multi_summary_sorts_and_headers():
         side_effect=[
             ("觀望（防守｜防守）", FinalAction.WATCH, "Guard"),
             ("減碼（結構｜結構）", FinalAction.REDUCE, "Gate"),
-            ("出場（動能｜動能）", FinalAction.EXIT, "Trigger"),
+            ("出場（上漲力道｜上漲力道）", FinalAction.EXIT, "Trigger"),
         ],
     ):
         text = sqs._run_multi_stock_summary(cmd, time_range="1y")
@@ -98,7 +98,7 @@ def test_run_multi_ultra_compact_lines():
         side_effect=[
             ("觀望（防守｜防守）", FinalAction.WATCH, "Guard"),
             ("減碼（結構｜結構）", FinalAction.REDUCE, "Gate"),
-            ("出場（動能｜動能）", FinalAction.EXIT, "Trigger"),
+            ("出場（上漲力道｜上漲力道）", FinalAction.EXIT, "Trigger"),
         ],
     ):
         text = sqs._run_multi_stock_summary(cmd, time_range="1y")
@@ -129,7 +129,7 @@ def test_run_multi_ultra_optional_primary_category():
         text = sqs._run_multi_stock_summary(
             cmd, time_range="1y", multi_ultra_show_category=True
         )
-    assert "2367 → 出場｜動能" in text
+    assert "2367 → 出場｜上漲力道" in text
     assert "3189 → 減碼｜結構" in text
     assert "3037 → 觀望｜防守" in text
 

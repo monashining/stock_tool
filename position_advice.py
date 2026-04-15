@@ -109,7 +109,7 @@ def get_position_advice(
             bullets.append("進場燈為紅燈：偏保守，避免追價。")
 
         if t_status in ["WATCH", "BLOCK"] or bias_hit:
-            bullets.append("top 轉弱/過熱：風險升溫；若續漲可考慮分批落袋。")
+            bullets.append("漲多轉弱：風險升溫；若續漲可考慮分批落袋。")
 
         return PositionAdvice(
             level="info",
@@ -199,7 +199,7 @@ def get_position_advice(
             bias_hit or (ema_bias is not None and ema_bias >= 7.0)
         ):
             bullets.append(
-                "補充：已有不小獲利且 top 風險升溫，即使型態尚可也可先分批落袋。"
+                "補充：已有不小獲利且高檔風險升溫，即使型態尚可也可先分批落袋。"
             )
         if below_defense is True and resolution.primary_reason != ReasonCode.PRICE_BELOW_EMA5:
             if ema is not None:
@@ -209,10 +209,10 @@ def get_position_advice(
             else:
                 bullets.append("已跌破自選防守線—請一併檢視是否同步減碼。")
         if t_status in ["WATCH", "BLOCK"] or bias_hit:
-            bullets.append("top 風險升溫：若續漲可先落袋一部分，避免回吐。")
+            bullets.append("高檔風險升溫：若續漲可先落袋一部分，避免回吐。")
 
     elif p >= 15.0 and (t_status == "BLOCK" or t_score >= 3) and (bias_hit or (ema_bias is not None and ema_bias >= 7.0)):
-        bullets.append("條件：Profit > 15% 且 top 風險升溫（含乖離過熱）。")
+        bullets.append("條件：獲利逾 15% 且高檔風險升溫（含乖離過熱）。")
         bullets.append("建議：分批減碼 30–50%（先回收獲利，避免回吐）。")
         if ema is not None:
             bullets.append(f"防守點：跌破防守線（約 {ema:.2f}）可再減碼/出清。")
@@ -220,13 +220,13 @@ def get_position_advice(
         headline = "高位階警示：建議分批減碼"
 
     elif below_defense is True and (t_score >= 2 or t_status in ["WATCH", "BLOCK"]) and p > 0:
-        bullets.append("條件：跌破防守線 + top 轉弱（或分數偏高）。")
+        bullets.append("條件：跌破防守線且漲多轉弱（或分數偏高）。")
         bullets.append("建議：先減碼 1/3 或直接落袋（依你的波段/短線習慣）。")
         level = "warning"
         headline = "跌破防守：建議先減碼/落袋"
 
     elif (-1.0 <= p <= 2.0) and b_score < 2:
-        bullets.append("條件：現價接近成本（+2%~-1%）且 bottom 分數不足。")
+        bullets.append("條件：現價接近成本（+2%～-1%）且進場訊號偏弱。")
         bullets.append("建議：以成本價做本金防守；破成本可考慮出場避免小虧變大虧。")
         level = "warning"
         headline = "成本防禦：本金保護優先"
@@ -241,7 +241,7 @@ def get_position_advice(
             headline = "續抱/觀察"
             bullets.append("訊號尚未出現強烈衝突：以防守線控風險、分批操作。")
         if t_status in ["WATCH", "BLOCK"] or bias_hit:
-            bullets.append("top 風險升溫：若續漲可先落袋一部分，避免回吐。")
+            bullets.append("高檔風險升溫：若續漲可先落袋一部分，避免回吐。")
 
     bullets.insert(0, f"未實現損益：約 {p:.1f}%")
     if pnl_amt is not None:
@@ -280,6 +280,7 @@ def build_exit_guide_push_text(
 ) -> str:
     """
     與個股頁「下車指南（白話文決策）」同邏輯，產純文字供 LINE「一般版」使用。
+    未輸入均價（LINE 一般使用者）：不提示填均價；一句說明後接與網頁相同的出場情境邏輯（不含損益％子彈）。
     """
     br, tr = bottom_result, top_result
     if isinstance(turn_result, dict) and br is None and tr is None:
@@ -300,15 +301,19 @@ def build_exit_guide_push_text(
 
     out: list[str] = []
     out.append(section_heading)
-    if float(avg_cost or 0.0) <= 0:
+    no_cost = float(avg_cost or 0.0) <= 0
+    if no_cost:
         out.append(
-            "尚未輸入持股均價：以下以技術燈號為主；若要損益％與分批建議，請先在網頁填均價。"
+            "以下依出場燈號與風險分數說明（一般版不含個人損益％與成本資料）。"
         )
-
-    out.append(f"持倉診斷摘要：{advice.headline}")
-    if advice.bullets:
-        for b in advice.bullets[:4]:
-            out.append(f"・{b}")
+    else:
+        out.append(f"持倉診斷摘要：{advice.headline}")
+        if advice.bullets:
+            for b in advice.bullets[:4]:
+                bt = (b or "").strip()
+                if not bt or bt.startswith("["):
+                    continue
+                out.append(f"・{bt}")
 
     tr_d = tr or turn_result or {}
     score = int(tr_d.get("score", 0) or 0)
@@ -408,8 +413,8 @@ def build_exit_guide_push_text(
             out.append("💎【獲利奔跑中】尚未觸發減碼／下車訊號，可續抱。")
     else:
         out.append(
-            "目前不是「出場燈號（top）」模式；要看這段白話下車指引，"
-            "建議在網頁把 TURN 切到 top，或勾選同時顯示 bottom + top。"
+            "此下車句需「漲多高檔」出場分析；請至網頁開啟相關圖表後再推播，"
+            "或改用進階版 LINE。"
         )
 
     return "\n".join(out)

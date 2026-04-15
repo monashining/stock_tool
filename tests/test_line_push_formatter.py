@@ -12,6 +12,8 @@ from line_push_formatter import (
     build_line_push_reader_plain,
     fuse_one_line_verdict_with_primary_risk,
     normalize_entry_reason,
+    scrub_line_push_engineering_terms,
+    strip_redundant_stock_name_from_line_expert_text,
     truncate_line_push,
     ultra_compact_one_line,
 )
@@ -234,11 +236,23 @@ def test_append_tail_full_has_expert():
     assert "結語" in lines
 
 
+def test_scrub_line_push_engineering_terms():
+    raw = "top 風險升溫；[STRUCTURE] bottom = ALLOW, top = WATCH"
+    out = scrub_line_push_engineering_terms(raw)
+    assert "高檔風險升溫" in out
+    assert "ALLOW" not in out
+    assert "WATCH" not in out
+    assert "bottom =" not in out
+    assert "進場=" in out
+
+
 def test_normalize_entry_reason_map():
+    assert normalize_entry_reason("gate_fail") == "進場條件不足"
+    assert normalize_entry_reason("trigger_fail") == "上漲力道不足"
     assert normalize_entry_reason("guard_fail") == "風險偏高"
     assert normalize_entry_reason("watch_fallback") == "條件未到"
     assert normalize_entry_reason("allow_default") == "條件到位"
-    assert normalize_entry_reason("allow_continuation") == "動能延續"
+    assert normalize_entry_reason("allow_continuation") == "漲勢延續"
 
 
 def test_build_entry_advice_one_line_allow_and_block():
@@ -256,7 +270,7 @@ def test_build_entry_advice_one_line_allow_and_block():
         guard_ok=True,
         trigger_type="CONTINUATION",
     )
-    assert "動能延續" in s_cont
+    assert "漲勢延續" in s_cont
     s_allow_def = build_entry_advice_one_line_for_push(
         gate_ok=True,
         trigger_ok=True,
@@ -278,7 +292,7 @@ def test_build_entry_advice_one_line_allow_and_block():
         bias20_pct=3.0,
         volume_spike=False,
     )
-    assert "未過關" in s3
+    assert "進場條件不足" in s3
     s4 = build_entry_advice_one_line_for_push(
         gate_ok=True,
         trigger_ok=True,
@@ -286,6 +300,15 @@ def test_build_entry_advice_one_line_allow_and_block():
         trigger_type="BREAKOUT",
     )
     assert "風險偏高" in s4
+
+
+def test_strip_redundant_stock_name_from_line_expert_text():
+    raw = "觀望保守：ChipMOS TECHNOLOGIES INC. 評分 44，建議等待更明確的點火訊號。"
+    out = strip_redundant_stock_name_from_line_expert_text(
+        raw, "ChipMOS TECHNOLOGIES INC."
+    )
+    assert "ChipMOS" not in out
+    assert "觀望保守：評分 44" in out
 
 
 def test_build_line_push_reader_plain_three_sections():
@@ -338,7 +361,64 @@ def test_build_line_push_reader_plain_three_sections():
     assert "咸魚翻身｜AI 專家診斷" in text
     assert "補充：TURN bottom" not in text
     assert "ALLOW 3/4" not in text
-    assert "綠燈" in text or "獲利奔跑" in text
+    assert "出場燈號與風險分數" in text
+    assert "均價" not in text
+    assert "持倉診斷摘要" not in text
+    assert "・進場燈" not in text
+
+
+def test_build_line_push_reader_plain_expert_omits_duplicate_company_name():
+    """標題已有股名時，專家段不重複顯示公司全名。"""
+    d = ResolvedDecision(
+        action=FinalAction.WATCH,
+        color=FinalColor.YELLOW,
+        state=FinalState.EXEC_GUARD_FAIL,
+        primary_reason=ReasonCode.EXEC_GUARD_FAILED,
+        reason_codes=[ReasonCode.EXEC_GUARD_FAILED],
+        summary_title="執行保護未通過",
+        summary_text="執行保護未通過，不適合積極續抱或加碼。",
+        expert_action_line="行動：減碼觀望。執行保護未過，避免主觀硬抱。",
+    )
+    pa = get_position_advice(
+        current_price=67.0,
+        avg_cost=0.0,
+        bottom_result={"status": "ALLOW", "score": 2},
+        top_result={"status": "WATCH", "score": 1, "mode": "top", "conditions": {}},
+        ema5_short=65.0,
+        ema20_trend=63.0,
+        ema_defense=65.0,
+    )
+    long_name = "ChipMOS TECHNOLOGIES INC."
+    expert = (
+        f"**觀望保守**：{long_name} 評分 44，建議等待更明確的點火訊號。\n\n"
+        "---\n**行動：減碼觀望**。執行保護未過。"
+    )
+    text = build_line_push_reader_plain(
+        ticker="8150.TW",
+        name=long_name,
+        close_price=67.0,
+        score=44,
+        has_position=False,
+        decision=d,
+        expert_msg=expert,
+        avg_cost=0.0,
+        exit_style="波段守五日線",
+        ema5=65.0,
+        ema20=63.0,
+        bottom_result={"status": "ALLOW", "score": 2},
+        top_result={"status": "WATCH", "score": 1, "mode": "top", "conditions": {}},
+        position_advice=pa,
+        entry_gate_ok=False,
+        entry_trigger_ok=True,
+        entry_guard_ok=True,
+        entry_trigger_type="NONE",
+        entry_bias20_pct=12.0,
+        entry_volume_spike=False,
+    )
+    assert long_name in text.split("咸魚翻身｜AI 專家診斷")[0]
+    expert_block = text.split("咸魚翻身｜AI 專家診斷", 1)[1]
+    assert "ChipMOS" not in expert_block
+    assert "觀望保守：評分 44" in expert_block
 
 
 def test_build_line_push_payload_turn_from_dict():

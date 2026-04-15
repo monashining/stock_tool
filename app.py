@@ -660,11 +660,11 @@ def render_trade_brief(used_map: dict, metrics: dict, *, has_position: bool = Fa
     st.markdown("### 🔍 核心阻礙（Top 3）")
     blockers = []
 
-    # 依優先順序抓：乖離 → 量能 → 動能（Trigger）
+    # 依優先順序抓：乖離 → 量能 → Trigger（上漲力道）
     key_priority = [
         ("Gate", "Bias20_gate", "乖離過大"),
         ("Gate", "Volume_gate", "成交爆量"),
-        ("Trigger", "BUY_TRIGGER", "動能不足"),
+        ("Trigger", "BUY_TRIGGER", "上漲力道不足"),
         ("Guard", "EXEC_GUARD", "執行護欄未過"),
         ("Gate", "SMA20", "趨勢未站上"),
         ("Gate", "SMA20_up", "趨勢未走升"),
@@ -811,7 +811,7 @@ def render_trade_brief(used_map: dict, metrics: dict, *, has_position: bool = Fa
             bullets.append("等待 Bias20 回落至 10% 以內（修正過熱）。")
         if b["風險項目"] == "成交爆量":
             bullets.append("等待成交量回到 VolMA20 附近（量能穩定）。")
-        if b["風險項目"] == "動能不足":
+        if b["風險項目"] == "上漲力道不足":
             bullets.append("等待 Trigger 出現（PULLBACK / BREAKOUT / CONTINUATION 任一成立）。")
     if chip_bad:
         bullets.append("等待外資由賣轉買（外資 3 日轉正更佳）。")
@@ -5367,7 +5367,8 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
             horizontal=True,
             index=0,
             key="line_diagnosis_push_mode",
-            help="一般版：主結論、建倉一句、📍 下車指南、咸魚翻身｜AI 專家診斷（與網頁命名一致）；不含 TURN 代碼與風險規則表。"
+            help="一般版：主結論、建倉一句、📍 下車指南、咸魚翻身｜AI 專家診斷（與網頁命名一致）；"
+            "下車指南依燈號與風險分數，不需輸入成本。不含 TURN 代碼與風險規則表。"
             "精簡／完整：保留給需要技術細節的使用者。",
         )
         _line_compact = _line_push_mode == "精簡（進階）"

@@ -209,7 +209,7 @@ def expert_action_line_markdown(decision: ResolvedDecision) -> str:
     """專家區塊用：套上粗體行動句。"""
     t = (decision.expert_action_line or "").strip()
     if not t:
-        return "**行動：觀望**。條件不足。"
+        return "**行動：觀望**。進場條件不足。"
     if t.startswith("**"):
         return t
     return f"**{t}**"
