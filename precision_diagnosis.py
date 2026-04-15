@@ -25,6 +25,15 @@ def _fmt_wan(x: Any) -> str:
     return f"{v:,.0f}"
 
 
+# 精準診斷「行動」內部仍用英文枚舉；對使用者輸出改為白話（避免 ALLOW 等術語）
+_PRECISION_ACTION_USER_ZH: dict[str, str] = {
+    "ALLOW": "可依策略執行（籌碼與位階未亮紅燈）",
+    "WATCH": "建議保守應對（先觀望或分批）",
+    "REDUCE": "建議降低持股",
+    "EXIT": "建議出場或嚴控部位",
+}
+
+
 @dataclass(frozen=True)
 class PrecisionDiagnosis:
     """
@@ -42,7 +51,10 @@ class PrecisionDiagnosis:
 
     def as_one_liner(self) -> str:
         prefix = "✅" if self.level == "ok" else "⚠️" if self.level == "warning" else "🚨"
-        return f"{prefix} {self.headline}｜行動：{self.action}"
+        act_zh = _PRECISION_ACTION_USER_ZH.get(
+            str(self.action).strip().upper(), str(self.action)
+        )
+        return f"{prefix} {self.headline}｜建議：{act_zh}"
 
 
 def diagnose_precision(

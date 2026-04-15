@@ -7,11 +7,16 @@ from types import SimpleNamespace
 from line_push_formatter import (
     LINE_PUSH_MAX_CHARS,
     append_line_push_tail,
+    build_entry_advice_one_line_for_push,
     build_line_push_payload,
+    build_line_push_reader_plain,
     fuse_one_line_verdict_with_primary_risk,
+    normalize_entry_reason,
     truncate_line_push,
     ultra_compact_one_line,
 )
+from final_decision_resolver import FinalAction, FinalColor, FinalState, ReasonCode, ResolvedDecision
+from position_advice import PositionAdvice, get_position_advice
 
 
 def test_ultra_compact_one_line():
@@ -227,6 +232,113 @@ def test_append_tail_full_has_expert():
     )
     assert "專家：" in lines
     assert "結語" in lines
+
+
+def test_normalize_entry_reason_map():
+    assert normalize_entry_reason("guard_fail") == "風險偏高"
+    assert normalize_entry_reason("watch_fallback") == "條件未到"
+    assert normalize_entry_reason("allow_default") == "條件到位"
+    assert normalize_entry_reason("allow_continuation") == "動能延續"
+
+
+def test_build_entry_advice_one_line_allow_and_block():
+    s = build_entry_advice_one_line_for_push(
+        gate_ok=True,
+        trigger_ok=True,
+        guard_ok=True,
+        trigger_type="PULLBACK",
+    )
+    assert s.startswith("🚩 建倉建議：條件偏多")
+    assert "回檔" in s
+    s_cont = build_entry_advice_one_line_for_push(
+        gate_ok=True,
+        trigger_ok=True,
+        guard_ok=True,
+        trigger_type="CONTINUATION",
+    )
+    assert "動能延續" in s_cont
+    s_allow_def = build_entry_advice_one_line_for_push(
+        gate_ok=True,
+        trigger_ok=True,
+        guard_ok=True,
+        trigger_type="NONE",
+    )
+    assert "條件到位" in s_allow_def
+    s2 = build_entry_advice_one_line_for_push(
+        gate_ok=False,
+        trigger_ok=False,
+        guard_ok=False,
+        bias20_pct=12.0,
+    )
+    assert "過熱" in s2
+    s3 = build_entry_advice_one_line_for_push(
+        gate_ok=False,
+        trigger_ok=True,
+        guard_ok=True,
+        bias20_pct=3.0,
+        volume_spike=False,
+    )
+    assert "未過關" in s3
+    s4 = build_entry_advice_one_line_for_push(
+        gate_ok=True,
+        trigger_ok=True,
+        guard_ok=False,
+        trigger_type="BREAKOUT",
+    )
+    assert "風險偏高" in s4
+
+
+def test_build_line_push_reader_plain_three_sections():
+    """一般版：主結論／建倉一句／下車指南／專家，不出現 TURN bottom｜ALLOW。"""
+    d = ResolvedDecision(
+        action=FinalAction.HOLD,
+        color=FinalColor.GREEN,
+        state=FinalState.HEALTHY_TREND,
+        primary_reason=ReasonCode.BOTTOM_ALLOW,
+        reason_codes=[ReasonCode.BOTTOM_ALLOW],
+        summary_title="結構偏多",
+        summary_text="底部結構仍可觀察。",
+        expert_action_line="行動：續抱。結構仍在，可依策略防守。",
+    )
+    pa = get_position_advice(
+        current_price=100.0,
+        avg_cost=0.0,
+        bottom_result={"status": "ALLOW", "score": 3},
+        top_result={"status": "ALLOW", "score": 0, "mode": "top", "conditions": {}},
+        ema5_short=98.0,
+        ema20_trend=95.0,
+        ema_defense=98.0,
+    )
+    text = build_line_push_reader_plain(
+        ticker="2330.TW",
+        name="台積電",
+        close_price=100.0,
+        score=88,
+        has_position=True,
+        decision=d,
+        expert_msg="**趨勢穩定**：評分高。\n\n---\n**行動：續抱**。",
+        avg_cost=0.0,
+        exit_style="波段守五日線",
+        ema5=98.0,
+        ema20=95.0,
+        bottom_result={"status": "ALLOW", "score": 3},
+        top_result={"status": "ALLOW", "score": 0, "mode": "top", "conditions": {}},
+        position_advice=pa,
+        entry_gate_ok=True,
+        entry_trigger_ok=True,
+        entry_guard_ok=True,
+        entry_trigger_type="PULLBACK",
+        entry_bias20_pct=3.0,
+        entry_volume_spike=False,
+    )
+    assert "收盤參考：" in text
+    assert "🚩 建倉建議：" in text
+    assert "回檔" in text
+    assert "📍 下車指南" in text
+    assert "咸魚翻身｜AI 專家診斷" in text
+    assert "補充：TURN bottom" not in text
+    assert "ALLOW 3/4" not in text
+    assert "綠燈" in text or "獲利奔跑" in text
 
 
 def test_build_line_push_payload_turn_from_dict():

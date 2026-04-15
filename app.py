@@ -50,7 +50,11 @@ from utils import (
     to_scalar,
 )
 from position_advice import get_position_advice
-from line_push_formatter import COMPACT_SHORT_RISK_MAX, build_line_push_payload
+from line_push_formatter import (
+    COMPACT_SHORT_RISK_MAX,
+    build_line_push_payload,
+    build_line_push_reader_plain,
+)
 from plain_language_narrator import (
     PlainLanguageNarratorInput,
     build_plain_language_summary,
@@ -606,15 +610,11 @@ def render_trade_brief(used_map: dict, metrics: dict, *, has_position: bool = Fa
     # -------- 狀態總覽 --------
     st.markdown("### 🚩 建倉建議（該不該買）")
     st.caption("此區回答「現在適不適合買進」。持倉者請以「持倉診斷／下車指南」為準。")
-    if overall_ok:
-        st.success("✅ PASS（符合買入條件）")
-        st.caption(f"狀態總覽：Gate=PASS｜Trigger=PASS（{trigger_type}）｜Guard=PASS")
-    else:
-        # 若 gate 失敗且過熱/爆量 → 直接用「高度過熱」語氣
+    overheat = False
+    if not overall_ok:
         bias_v = metrics.get("bias_sma20_pct")
         vol_v = metrics.get("Volume")
         volma_v = metrics.get("VolMA20")
-        overheat = False
         try:
             if bias_v is not None and np.isfinite(float(bias_v)) and abs(float(bias_v)) > 10:
                 overheat = True
@@ -626,16 +626,38 @@ def render_trade_brief(used_map: dict, metrics: dict, *, has_position: bool = Fa
                     overheat = True
         except Exception:
             pass
+
+    if overall_ok:
+        st.success("✅ PASS（符合買入條件）")
+    else:
         headline = "高度過熱，暫不入場" if overheat else "暫不入場（未通過門檻）"
         st.warning(f"⚠️ 建倉：FAIL（不符合買入條件）｜{headline}")
-        st.caption(
-            f"狀態總覽：Gate={'PASS' if gate_ok else 'FAIL'}｜"
-            f"Trigger={'PASS' if trig_ok else 'FAIL'}（{trigger_type}）｜"
-            f"Guard={'PASS' if guard_ok else 'FAIL'}"
+
+    # 結論後立刻給「下一步」— 再列 Gate／阻礙／籌碼作為依據
+    st.markdown("### 📌 建議（下一步）")
+    if overall_ok:
+        st.info(
+            "條件已通過：若要建新倉，建議分批、守防守線（例如 EMA5 或關鍵價），避免單筆重押。"
+            "請一併看完下方「籌碼異狀」；若有警訊，寧可改成少量試單或再等。"
         )
+    else:
+        if overheat:
+            st.info(
+                "目前價量偏熱：建議先觀望、不追價；若要做多，優先等乖離收斂、量能回到均量附近，再重新看建倉條件。"
+            )
+        else:
+            st.info(
+                "尚未同時通過 Gate／Trigger／Guard：建議先觀望、不勉強進場；請對照下方「核心阻礙」逐項改善後再評估。"
+            )
+
+    st.caption(
+        f"狀態總覽：Gate={'PASS' if gate_ok else 'FAIL'}｜"
+        f"Trigger={'PASS' if trig_ok else 'FAIL'}（{trigger_type}）｜"
+        f"Guard={'PASS' if guard_ok else 'FAIL'}"
+    )
 
     # -------- 核心阻礙（Top 3）--------
-    st.markdown("### 2️⃣ 核心阻礙（Top 3）")
+    st.markdown("### 🔍 核心阻礙（Top 3）")
     blockers = []
 
     # 依優先順序抓：乖離 → 量能 → 動能（Trigger）
@@ -704,7 +726,7 @@ def render_trade_brief(used_map: dict, metrics: dict, *, has_position: bool = Fa
         st.success("✅ 目前沒有明顯阻礙（核心門檻皆通過）")
 
     # -------- 籌碼異狀 --------
-    st.markdown("### 3️⃣ 籌碼異狀（Chip Notes）")
+    st.markdown("### 🪙 籌碼異狀（Chip Notes）")
     chip_bad = False
     try:
         chip_bad = bool((chip_div or {}).get("value", False))
@@ -769,14 +791,18 @@ def render_trade_brief(used_map: dict, metrics: dict, *, has_position: bool = Fa
     if inst_participation_pct is not None:
         st.caption(f"法人參與度（對作/成交量，近3日）：約 {float(inst_participation_pct):.1f}%（越低越像散戶在玩）")
 
-    # -------- Action plan --------
-    st.markdown("### 💡 濃縮建議（Action Plan）")
-    if overall_ok:
-        st.info("目前策略：ALLOW（可進入）。建議分批、以防守線控風險。")
-        if chip_bad or (showdown_ratio is not None and float(showdown_ratio) > 100.0):
-            st.warning("⚠️ 策略降級：技術面雖通過，但籌碼背離/對峙偏強，建議改以 WATCH 方式進場（等量縮或等外資止賣）。")
-    else:
-        st.info("目前策略：WATCH（觀望）。禁止追價進場。")
+    # 技術通過但籌碼拉警報：放在證據讀完後再降級提醒（避免與開頭建議重複）
+    if overall_ok and (
+        chip_bad
+        or (showdown_ratio is not None and float(showdown_ratio) > 100.0)
+    ):
+        st.warning(
+            "⚠️ 降級提醒：技術條件雖通過，但籌碼背離或土洋對峙偏空。"
+            "若要進場，建議改成「觀望式」— 小量試單、等量能收斂或外資賣壓緩和再加碼，不宜追高滿倉。"
+        )
+
+    st.markdown("### 📋 待觀察／再評估條件")
+    st.caption("對照下方條件逐項改善後，再回到本區看是否轉為 PASS。")
 
     bullets = []
     # 依 blockers 生成待觀察條件
@@ -5337,12 +5363,14 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
                 diagnosis_summary.error(msg)
         _line_push_mode = st.radio(
             "LINE 推播範圍",
-            ["完整", "精簡"],
+            ["一般版（推薦）", "精簡（進階）", "完整（進階）"],
             horizontal=True,
+            index=0,
             key="line_diagnosis_push_mode",
-            help="精簡：結論＋TURN／防守濃縮＋風險最多 2 條，不含專家長文。完整：含防守細節、風險明細、專家診斷。",
+            help="一般版：主結論、建倉一句、📍 下車指南、咸魚翻身｜AI 專家診斷（與網頁命名一致）；不含 TURN 代碼與風險規則表。"
+            "精簡／完整：保留給需要技術細節的使用者。",
         )
-        _line_compact = _line_push_mode == "精簡"
+        _line_compact = _line_push_mode == "精簡（進階）"
         if st.button("一鍵傳送完整診斷到 LINE"):
             try:
                 _rdc = locals().get("page_resolved_decision")
@@ -5369,49 +5397,118 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
                 _bottom_now = locals().get("bottom_now")
                 _top_now = locals().get("top_now")
 
-                fail_lines = build_fail_lines_from_used_map(used_map, max_lines=5)
-                _short_max = COMPACT_SHORT_RISK_MAX if _line_compact else 5
-                fail_lines_short = build_fail_lines_short_from_used_map(
-                    used_map, max_lines=_short_max
-                )
-                _primary_risk_cat = get_primary_risk_category(used_map)
-
-                _payload = build_line_push_payload(
-                    mode="compact" if _line_compact else "full",
-                    ticker=str(ticker),
-                    name=str(name or ""),
-                    close_price=float(close_price),
-                    score=int(score),
-                    has_position=bool(has_pos),
-                    decision=_rdc,
-                    one_line_verdict=(
-                        (_pls_ln.one_line_verdict or "").strip() if _pls_ln else ""
-                    ),
-                    summary_fallback=_sum_fb,
-                    bottom_now=_bottom_now,
-                    top_now=_top_now,
-                    guard=guard,
-                    defense_name=_defense_name,
-                    fail_lines=fail_lines,
-                    fail_lines_short=fail_lines_short,
-                    expert_msg=str(expert_msg or ""),
-                    merge_primary_risk_into_verdict=True,
-                    primary_risk_category=_primary_risk_cat,
-                    merge_primary_risk_show_category=True,
-                )
-
-                ok, msg = send_with_cooldown(
-                    f"{effective_symbol}_full_diagnosis_{'c' if _line_compact else 'f'}",
-                    _payload,
-                    cooldown_minutes=5,
-                )
-                if ok:
-                    _sym = str(effective_symbol or ticker or "").strip()
-                    st.success(
-                        f"已推播（{'精簡' if _line_compact else '完整'}）｜{_sym}"
-                    )
+                if _line_push_mode == "一般版（推薦）":
+                    _pa = locals().get("pos_advice")
+                    if _pa is None:
+                        st.warning("無法組裝一般版推播：請確認本頁已載入個股資料（下車指南區塊會一併計算持倉建議）。")
+                    else:
+                        _ema5_push = (
+                            float(ema5)
+                            if ema5 is not None and not pd.isna(ema5)
+                            else None
+                        )
+                        _ema20_push = (
+                            float(ema20)
+                            if ema20 is not None and not pd.isna(ema20)
+                            else None
+                        )
+                        _b20_line = None
+                        try:
+                            _bx = latest.get("Bias20")
+                            if _bx is not None and not pd.isna(_bx):
+                                _b20_line = float(_bx)
+                        except Exception:
+                            pass
+                        _vol_spike_line = False
+                        try:
+                            _lv = float(latest.get("Volume"))
+                            _lvm = float(latest.get("VolMA20"))
+                            if (
+                                np.isfinite(_lv)
+                                and np.isfinite(_lvm)
+                                and _lvm > 0
+                                and _lv > 1.5 * _lvm
+                            ):
+                                _vol_spike_line = True
+                        except Exception:
+                            pass
+                        _payload = build_line_push_reader_plain(
+                            ticker=str(ticker),
+                            name=str(name or ""),
+                            close_price=float(close_price),
+                            score=int(score),
+                            has_position=bool(has_pos),
+                            decision=_rdc,
+                            expert_msg=str(expert_msg or ""),
+                            avg_cost=float(locals().get("pos_avg_cost", 0) or 0),
+                            exit_style=_exit_style or "波段守五日線",
+                            ema5=_ema5_push,
+                            ema20=_ema20_push,
+                            bottom_result=_bottom_now,
+                            top_result=_top_now,
+                            turn_result=None,
+                            position_advice=_pa,
+                            entry_gate_ok=bool(gate_ok),
+                            entry_trigger_ok=bool(trigger_ok),
+                            entry_guard_ok=bool(exec_guard_ok),
+                            entry_trigger_type=str(trigger_type or ""),
+                            entry_bias20_pct=_b20_line,
+                            entry_volume_spike=_vol_spike_line,
+                        )
+                        ok, msg = send_with_cooldown(
+                            f"{effective_symbol}_reader_diagnosis",
+                            _payload,
+                            cooldown_minutes=5,
+                        )
+                        if ok:
+                            _sym = str(effective_symbol or ticker or "").strip()
+                            st.success(f"已推播（一般版）｜{_sym}")
+                        else:
+                            st.warning(msg)
                 else:
-                    st.warning(msg)
+                    fail_lines = build_fail_lines_from_used_map(used_map, max_lines=5)
+                    _short_max = COMPACT_SHORT_RISK_MAX if _line_compact else 5
+                    fail_lines_short = build_fail_lines_short_from_used_map(
+                        used_map, max_lines=_short_max
+                    )
+                    _primary_risk_cat = get_primary_risk_category(used_map)
+
+                    _payload = build_line_push_payload(
+                        mode="compact" if _line_compact else "full",
+                        ticker=str(ticker),
+                        name=str(name or ""),
+                        close_price=float(close_price),
+                        score=int(score),
+                        has_position=bool(has_pos),
+                        decision=_rdc,
+                        one_line_verdict=(
+                            (_pls_ln.one_line_verdict or "").strip() if _pls_ln else ""
+                        ),
+                        summary_fallback=_sum_fb,
+                        bottom_now=_bottom_now,
+                        top_now=_top_now,
+                        guard=guard,
+                        defense_name=_defense_name,
+                        fail_lines=fail_lines,
+                        fail_lines_short=fail_lines_short,
+                        expert_msg=str(expert_msg or ""),
+                        merge_primary_risk_into_verdict=True,
+                        primary_risk_category=_primary_risk_cat,
+                        merge_primary_risk_show_category=True,
+                    )
+
+                    ok, msg = send_with_cooldown(
+                        f"{effective_symbol}_full_diagnosis_{'c' if _line_compact else 'f'}",
+                        _payload,
+                        cooldown_minutes=5,
+                    )
+                    if ok:
+                        _sym = str(effective_symbol or ticker or "").strip()
+                        st.success(
+                            f"已推播（{'精簡' if _line_compact else '完整'}）｜{_sym}"
+                        )
+                    else:
+                        st.warning(msg)
             except Exception as exc:
                 st.warning(f"推播失敗：{exc}")
 

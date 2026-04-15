@@ -1,5 +1,6 @@
 """
-群組查股：載入行情 → ResolvedDecision → PlainLanguageSummary → build_line_push_payload。
+群組查股：載入行情 → ResolvedDecision → PlainLanguageSummary。
+單檔：與網頁「一般版」LINE 相同，走 build_line_push_reader_plain（主結論／建倉一句／📍 下車指南／咸魚翻身｜AI 專家診斷）。
 多檔：精簡一行列示（與單檔精簡一句話＋主風險融合同源）。
 """
 from __future__ import annotations
@@ -28,9 +29,10 @@ from line_group_query_bot import GroupQueryCommand
 from line_push_formatter import (
     COMPACT_SHORT_RISK_MAX,
     PRIMARY_RISK_CATEGORY_SHORT_LABEL,
-    build_line_push_payload,
+    build_line_push_reader_plain,
     fuse_one_line_verdict_with_primary_risk,
 )
+from position_advice import get_position_advice
 from line_quick_reply import display_code_for_quick_reply
 from plain_language_narrator import (
     PlainLanguageNarratorInput,
@@ -38,7 +40,6 @@ from plain_language_narrator import (
     build_plain_language_summary,
     can_buy_the_dip,
 )
-from tomorrow_guard_price import calc_tomorrow_guard
 from utils import to_scalar
 
 # 多檔列示：最嚴重優先（與群組「先看風險」一致）
@@ -120,23 +121,6 @@ def _chip_3d_net(series: Optional[pd.Series]) -> Optional[float]:
     if series is None or len(series) < 3:
         return None
     return float(series.sort_index().tail(3).sum())
-
-
-def _guard_and_defense(
-    snap: LineDiagnosisSnapshot,
-    *,
-    pos_exit_style: str = "波段守五日線",
-):
-    _defense = snap.ema20 if pos_exit_style == "長線守月線" else snap.ema5
-    _defense_name = "EMA20（月線）" if pos_exit_style == "長線守月線" else "EMA5（五日線）"
-    guard = None
-    if _defense is not None:
-        guard = calc_tomorrow_guard(
-            ema_today=float(_defense),
-            window=20 if pos_exit_style == "長線守月線" else 5,
-            buffer_pct=1.5,
-        )
-    return guard, _defense_name
 
 
 def _decision_narr_pl(
@@ -329,6 +313,27 @@ def _run_multi_stock_summary(
     return out
 
 
+def _entry_push_inputs_from_snap(snap: LineDiagnosisSnapshot) -> tuple[Optional[float], bool]:
+    """Bias20（%）與是否量超 1.5×VolMA20，供建倉一句話。"""
+    lr = snap.latest
+    bias: Optional[float] = None
+    vol_spike = False
+    try:
+        b = lr.get("Bias20")
+        if b is not None and not pd.isna(b):
+            bias = float(b)
+    except Exception:
+        pass
+    try:
+        v = float(lr.get("Volume"))
+        vm = float(lr.get("VolMA20"))
+        if np.isfinite(v) and np.isfinite(vm) and vm > 0 and v > 1.5 * vm:
+            vol_spike = True
+    except Exception:
+        pass
+    return bias, vol_spike
+
+
 def _run_single_stock_query(cmd: GroupQueryCommand, *, time_range: str) -> str:
     snap = build_line_diagnosis_snapshot(cmd.ticker_normalized, time_range=time_range)
 
@@ -351,68 +356,50 @@ def _run_single_stock_query(cmd: GroupQueryCommand, *, time_range: str) -> str:
             f"{pl_summary.what_to_wait_for}"
         ).strip()
 
-    mode = "full" if cmd.action == "full" else "compact"
-
-    guard, defense_name = _guard_and_defense(snap)
-
-    _sum_fb = (
-        (pl_summary.what_to_wait_for or "").strip()
-        or (pl_summary.current_state or "").strip()
+    _exit_style = "波段守五日線"
+    _defense = snap.ema20 if _exit_style == "長線守月線" else snap.ema5
+    bottom_d = snap.bottom_now if isinstance(snap.bottom_now, dict) else None
+    top_d = snap.top_now if isinstance(snap.top_now, dict) else None
+    position_advice = get_position_advice(
+        current_price=float(snap.close_price),
+        avg_cost=0.0,
+        qty=0,
+        ema_defense=_defense,
+        bottom_result=bottom_d,
+        top_result=top_d,
+        ema5_short=snap.ema5,
+        ema20_trend=snap.ema20,
+        ai_score=float(snap.weighted_score),
+        guard_ok=bool(snap.exec_guard_ok),
+        gate_pass=bool(snap.gate_ok),
+        trigger_pass=bool(snap.trigger_ok),
+        guard_pass=bool(snap.exec_guard_ok),
+        position_mode=position_mode,
     )
 
-    prev_close = to_scalar(snap.df["Close"].iloc[-2]) if len(snap.df) >= 2 else None
-    bias_20_val = to_scalar(snap.latest.get("Bias20", np.nan))
-    sma20_val = to_scalar(snap.latest.get("SMA20", np.nan))
-    latest_volume = to_scalar(snap.latest.get("Volume"))
-    vol_ma20_val = to_scalar(snap.latest.get("VolMA20", np.nan))
-
-    fn = snap.foreign_net_series
-    foreign_net_latest = float(fn.iloc[-1]) if fn is not None and not fn.empty else None
-    foreign_3d_net = _chip_3d_net(fn)
-    trust_3d_net = _chip_3d_net(snap.trust_net_series)
-
-    used_map = build_used_map_for_signals(
-        snap.df,
-        snap.latest,
-        close_price=float(snap.close_price),
-        prev_close=prev_close,
-        bias_20_val=bias_20_val,
-        sma20_val=sma20_val,
-        latest_volume=latest_volume,
-        vol_ma20_val=vol_ma20_val,
-        trigger_type=str(snap.trigger_type),
-        foreign_divergence_warning=snap.foreign_divergence_warning,
-        foreign_net_latest=foreign_net_latest,
-        foreign_3d_net=foreign_3d_net,
-        trust_3d_net=trust_3d_net,
-    )
-    fail_lines = build_fail_lines_from_used_map(used_map, max_lines=5)
-    _short_max = COMPACT_SHORT_RISK_MAX if mode == "compact" else 5
-    fail_lines_short = build_fail_lines_short_from_used_map(
-        used_map, max_lines=_short_max
-    )
-    _primary_cat = get_primary_risk_category(used_map)
-
-    return build_line_push_payload(
-        mode=mode,
+    _b20, _vsp = _entry_push_inputs_from_snap(snap)
+    return build_line_push_reader_plain(
         ticker=str(snap.effective_symbol),
         name=str(snap.name or ""),
         close_price=float(snap.close_price),
         score=int(snap.score),
         has_position=position_mode,
         decision=decision,
-        one_line_verdict=(pl_summary.one_line_verdict or "").strip(),
-        summary_fallback=_sum_fb,
-        bottom_now=snap.bottom_now,
-        top_now=snap.top_now,
-        guard=guard,
-        defense_name=defense_name,
-        fail_lines=fail_lines,
-        fail_lines_short=fail_lines_short,
         expert_msg=str(snap.expert_msg or ""),
-        merge_primary_risk_into_verdict=True,
-        primary_risk_category=_primary_cat,
-        merge_primary_risk_show_category=True,
+        avg_cost=0.0,
+        exit_style=_exit_style,
+        ema5=snap.ema5,
+        ema20=snap.ema20,
+        bottom_result=bottom_d,
+        top_result=top_d,
+        turn_result=None,
+        position_advice=position_advice,
+        entry_gate_ok=bool(snap.gate_ok),
+        entry_trigger_ok=bool(snap.trigger_ok),
+        entry_guard_ok=bool(snap.exec_guard_ok),
+        entry_trigger_type=str(snap.trigger_type or ""),
+        entry_bias20_pct=_b20,
+        entry_volume_spike=_vsp,
     )
 
 

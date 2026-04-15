@@ -13,9 +13,20 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from final_decision_resolver import ResolvedDecision, build_compact_line_diagnosis
+from final_decision_resolver import (
+    ACTION_UI,
+    ResolvedDecision,
+    build_compact_line_diagnosis,
+    get_status_bar_label,
+    get_status_bar_title,
+)
+from position_advice import PositionAdvice, build_exit_guide_push_text
 
 LINE_PUSH_MAX_CHARS = 4800
+
+# 一般版 LINE 固定章節名（全站／群組／網頁推播一致，勿混用其他別名）
+READER_LINE_HEADING_EXIT = "📍 下車指南"
+READER_LINE_HEADING_EXPERT = "咸魚翻身｜AI 專家診斷"
 
 # 精簡模式尾段「風險：」最多列幾條短句（與 append_line_push_tail 一致）
 COMPACT_SHORT_RISK_MAX = 2
@@ -220,3 +231,210 @@ def build_line_push_payload(
         fail_lines_short=eff_short if mode == "compact" else fail_lines_short,
     )
     return truncate_line_push("\n".join(lines), max_chars=max_chars)
+
+
+def strip_markdown_for_line_push(text: str) -> str:
+    """LINE 純文字：去掉常見 Markdown 粗體符號。"""
+    return (text or "").replace("**", "").strip()
+
+
+def _finite_pct(x: Any) -> bool:
+    try:
+        v = float(x)
+        return v == v and abs(v) != float("inf")
+    except (TypeError, ValueError):
+        return False
+
+
+def normalize_entry_reason(reason_key: str) -> str:
+    """
+    建倉一句話「括號內」用語：內部鍵 → 結果導向、同一語氣層；改文案只改此 mapping。
+    reason_key：如 gate_fail、overheat、allow_default、allow_continuation …
+    """
+    mapping = {
+        # BLOCK
+        "gate_fail": "未過關",
+        "overheat": "過熱",
+        "volume_spike": "爆量",
+        # WATCH（Guard 未過 → 不寫工程詞「護欄」）
+        "guard_fail": "風險偏高",
+        "trigger_fail": "動能不足",
+        "watch_fallback": "條件未到",
+        # ALLOW
+        "allow_pullback": "回檔",
+        "allow_breakout": "突破",
+        "allow_continuation": "動能延續",
+        "allow_default": "條件到位",
+    }
+    k = (reason_key or "").strip()
+    return mapping.get(k, k or "—")
+
+
+def build_entry_advice_one_line_for_push(
+    *,
+    gate_ok: bool,
+    trigger_ok: bool,
+    guard_ok: bool,
+    trigger_type: str = "",
+    bias20_pct: Optional[float] = None,
+    volume_spike: bool = False,
+) -> str:
+    """
+    建倉一句話（僅 LINE 一般版）：接在主結論後，不含 Gate 表或整區建倉文案。
+    guard_ok 對應頁面 EXEC_GUARD（與 BUY_SIGNAL 敘述一致）。
+    """
+    overall = bool(gate_ok and trigger_ok and guard_ok)
+    overheat_bias = bool(
+        bias20_pct is not None
+        and _finite_pct(bias20_pct)
+        and abs(float(bias20_pct)) > 10.0
+    )
+
+    if overall:
+        tt = (trigger_type or "").strip().upper()
+        rkey = {
+            "PULLBACK": "allow_pullback",
+            "BREAKOUT": "allow_breakout",
+            "CONTINUATION": "allow_continuation",
+        }.get(tt, "allow_default")
+        reason = normalize_entry_reason(rkey)
+        return f"🚩 建倉建議：條件偏多，可考慮分批進場（{reason}）"
+
+    if not gate_ok:
+        if overheat_bias:
+            return (
+                "🚩 建倉建議：目前過熱，暫不建議進場（"
+                f"{normalize_entry_reason('overheat')}）"
+            )
+        if volume_spike:
+            return (
+                "🚩 建倉建議：暫不建議進場（"
+                f"{normalize_entry_reason('volume_spike')}）"
+            )
+        return (
+            "🚩 建倉建議：暫不建議進場（"
+            f"{normalize_entry_reason('gate_fail')}）"
+        )
+
+    if not trigger_ok:
+        return (
+            "🚩 建倉建議：條件尚未成熟，建議等待（"
+            f"{normalize_entry_reason('trigger_fail')}）"
+        )
+
+    if not guard_ok:
+        return (
+            "🚩 建倉建議：條件尚未成熟，建議等待（"
+            f"{normalize_entry_reason('guard_fail')}）"
+        )
+
+    return (
+        "🚩 建倉建議：條件尚未成熟，建議等待（"
+        f"{normalize_entry_reason('watch_fallback')}）"
+    )
+
+
+def build_main_conclusion_push_text(
+    *,
+    ticker: str,
+    name: str = "",
+    close_price: float,
+    score: int,
+    has_position: bool,
+    decision: Optional[ResolvedDecision],
+) -> str:
+    """對齊網頁「主結論」卡：標的列＋燈號標題＋一句說明（不含 reason_code／trace）。"""
+    parts = [f"【{ticker}】"]
+    if name:
+        parts.append(str(name))
+    lines = [" ".join(parts).strip(), f"收盤參考：{close_price:.2f}", ""]
+    if decision is None:
+        lines.append("資料不足，尚無法產生主結論。")
+        lines.append(f"診斷分數（參考）：{score}")
+        return "\n".join(lines)
+    ui = ACTION_UI[decision.action]
+    title = get_status_bar_title(has_position)
+    lab = get_status_bar_label(decision, has_position)
+    lines.append(f"{ui['emoji']} {ui['label']}｜{decision.summary_title}")
+    lines.append(f"{title}：{lab}")
+    st = (decision.summary_text or "").strip()
+    if st:
+        lines.append(st)
+    ea = strip_markdown_for_line_push(decision.expert_action_line or "")
+    if ea and ea not in st:
+        lines.append(ea)
+    lines.append(f"診斷分數（參考）：{score}")
+    return "\n".join(lines)
+
+
+def build_line_push_reader_plain(
+    *,
+    ticker: str,
+    name: str = "",
+    close_price: float,
+    score: int,
+    has_position: bool,
+    decision: Optional[ResolvedDecision],
+    expert_msg: str,
+    avg_cost: float,
+    exit_style: str,
+    ema5: Optional[float],
+    ema20: Optional[float],
+    bottom_result: Optional[Dict[str, Any]] = None,
+    top_result: Optional[Dict[str, Any]] = None,
+    turn_result: Optional[Dict[str, Any]] = None,
+    position_advice: PositionAdvice,
+    entry_gate_ok: bool,
+    entry_trigger_ok: bool,
+    entry_guard_ok: bool,
+    entry_trigger_type: str = "",
+    entry_bias20_pct: Optional[float] = None,
+    entry_volume_spike: bool = False,
+    max_chars: int = LINE_PUSH_MAX_CHARS,
+) -> str:
+    """
+    一般使用者版 LINE：主結論 → 建倉一句話 → 下車指南 → 咸魚翻身｜AI 專家診斷，
+    不含 TURN 代碼列、used_map 風險條、精準診斷儀表板全文。
+    """
+    main = build_main_conclusion_push_text(
+        ticker=ticker,
+        name=name,
+        close_price=close_price,
+        score=score,
+        has_position=has_position,
+        decision=decision,
+    )
+    entry_line = build_entry_advice_one_line_for_push(
+        gate_ok=bool(entry_gate_ok),
+        trigger_ok=bool(entry_trigger_ok),
+        guard_ok=bool(entry_guard_ok),
+        trigger_type=str(entry_trigger_type or ""),
+        bias20_pct=entry_bias20_pct,
+        volume_spike=bool(entry_volume_spike),
+    )
+    exit_txt = build_exit_guide_push_text(
+        close_last=float(close_price),
+        avg_cost=float(avg_cost or 0.0),
+        exit_style=str(exit_style or "波段守五日線"),
+        ema5=ema5,
+        ema20=ema20,
+        bottom_result=bottom_result,
+        top_result=top_result,
+        turn_result=turn_result,
+        advice=position_advice,
+        section_heading=READER_LINE_HEADING_EXIT,
+    )
+    expert_plain = strip_markdown_for_line_push(expert_msg)
+    body = "\n".join(
+        [
+            main,
+            "",
+            entry_line,
+            "",
+            exit_txt,
+            "",
+            READER_LINE_HEADING_EXPERT,
+            expert_plain or "（無）",
+        ]
+    )
+    return truncate_line_push(body, max_chars=max_chars)

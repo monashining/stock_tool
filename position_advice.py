@@ -102,11 +102,11 @@ def get_position_advice(
     if a is None or a <= 0:
         bullets = []
         if b_status == "ALLOW":
-            bullets.append("bottom=ALLOW：偏多方，可續抱；防守點建議放在 EMA5。")
+            bullets.append("進場燈為綠燈：偏多方，可續抱；防守點建議放在 EMA5。")
         elif b_status == "WATCH":
-            bullets.append("bottom=WATCH：先觀察，等待站穩與量能延續再加碼。")
+            bullets.append("進場燈為黃燈：先觀察，等待站穩與量能延續再加碼。")
         else:
-            bullets.append("bottom=BLOCK：偏保守，避免追價。")
+            bullets.append("進場燈為紅燈：偏保守，避免追價。")
 
         if t_status in ["WATCH", "BLOCK"] or bias_hit:
             bullets.append("top 轉弱/過熱：風險升溫；若續漲可考慮分批落袋。")
@@ -153,7 +153,7 @@ def get_position_advice(
         )
         bullets.extend(list(resolution.trace_lines))
         bullets.append("條件：未實現損益 ≤ -5%。")
-        bullets.append("建議：若 bottom 未回到 WATCH/ALLOW，請嚴格執行停損或降部位。")
+        bullets.append("建議：若進場燈未回到黃燈／綠燈，請嚴格執行停損或降部位。")
         level = "error"
         headline = resolution.summary_title
 
@@ -235,7 +235,7 @@ def get_position_advice(
         if b_status == "ALLOW" and t_status == "ALLOW" and not bias_hit:
             level = "success"
             headline = "趨勢穩定：可續抱"
-            bullets.append("bottom=ALLOW 且 top 未亮風險：偏向續抱。")
+            bullets.append("進場為綠燈且出場風險燈未亮：偏向續抱。")
         else:
             level = "info"
             headline = "續抱/觀察"
@@ -252,3 +252,164 @@ def get_position_advice(
     return PositionAdvice(
         level=level, headline=headline, bullets=bullets, resolution=resolution
     )
+
+
+def humanize_turn_status_label(status: str) -> str:
+    """TURN 燈號：推播／白話用（不輸出 ALLOW 等代碼）。"""
+    u = str(status or "NA").strip().upper()
+    return {
+        "ALLOW": "綠燈（偏多）",
+        "WATCH": "黃燈（留意）",
+        "BLOCK": "紅燈（風險偏高）",
+        "NA": "未評估",
+    }.get(u, str(status or "NA"))
+
+
+def build_exit_guide_push_text(
+    *,
+    close_last: float,
+    avg_cost: float,
+    exit_style: str,
+    ema5: Optional[float],
+    ema20: Optional[float],
+    bottom_result: Optional[dict[str, Any]] = None,
+    top_result: Optional[dict[str, Any]] = None,
+    turn_result: Optional[dict[str, Any]] = None,
+    advice: PositionAdvice,
+    section_heading: str = "📍 下車指南",
+) -> str:
+    """
+    與個股頁「下車指南（白話文決策）」同邏輯，產純文字供 LINE「一般版」使用。
+    """
+    br, tr = bottom_result, top_result
+    if isinstance(turn_result, dict) and br is None and tr is None:
+        mode_tr = str(turn_result.get("mode", "top"))
+        if mode_tr == "bottom":
+            br = turn_result
+        elif mode_tr == "top":
+            tr = turn_result
+        else:
+            tr = turn_result
+
+    if exit_style == "長線守月線":
+        defense_name = "EMA20（月線）"
+        defense = ema20
+    else:
+        defense_name = "EMA5（五日線）"
+        defense = ema5
+
+    out: list[str] = []
+    out.append(section_heading)
+    if float(avg_cost or 0.0) <= 0:
+        out.append(
+            "尚未輸入持股均價：以下以技術燈號為主；若要損益％與分批建議，請先在網頁填均價。"
+        )
+
+    out.append(f"持倉診斷摘要：{advice.headline}")
+    if advice.bullets:
+        for b in advice.bullets[:4]:
+            out.append(f"・{b}")
+
+    tr_d = tr or turn_result or {}
+    score = int(tr_d.get("score", 0) or 0)
+    status = str(tr_d.get("status", "NA"))
+    mode = str(tr_d.get("mode", "top"))
+    bias_hit = bool((tr_d.get("conditions") or {}).get("bias"))
+
+    profit_ratio: Optional[float] = None
+    try:
+        ac = float(avg_cost)
+        if ac > 0:
+            profit_ratio = float(close_last) / ac - 1.0
+    except Exception:
+        profit_ratio = None
+
+    bias_ema5: Optional[float] = None
+    if ema5 is not None and float(ema5) > 0:
+        try:
+            bias_ema5 = float(close_last) / float(ema5) - 1.0
+        except Exception:
+            bias_ema5 = None
+
+    if exit_style == "積極分批止盈":
+        overheat_thr = 0.10
+        partial_text = "先賣出 1/2（或至少 1/3）"
+        score_trigger = 2
+    elif exit_style == "長線守月線":
+        overheat_thr = 0.12
+        partial_text = "先賣出 1/3"
+        score_trigger = 3
+    else:
+        overheat_thr = 0.10
+        partial_text = "先賣出 1/3"
+        score_trigger = 3
+
+    overheat = bool(bias_hit) or (
+        bias_ema5 is not None and float(bias_ema5) > float(overheat_thr)
+    )
+
+    status_zh = humanize_turn_status_label(status)
+
+    if mode == "top":
+        if (
+            score >= int(score_trigger)
+            and defense is not None
+            and float(defense) > 0
+            and float(close_last) < float(defense)
+        ):
+            out.append(
+                f"🚨【全數或大幅獲利了結】出場風險分數 {score}（滿分 5）且已跌破 {defense_name}"
+                f"（{float(defense):.2f}）。這通常是波段轉折點。"
+            )
+        elif overheat:
+            bias_txt = (
+                f"{(float(bias_ema5) * 100.0):.1f}%"
+                if bias_ema5 is not None
+                else "NA"
+            )
+            out.append(
+                f"⚠️【強勢減碼】相對五日線乖離約 {bias_txt}，出場燈為 {status_zh}、風險分數 {score}。"
+                f"建議{partial_text}，剩餘持股守 {defense_name}。"
+            )
+        elif (
+            exit_style == "積極分批止盈"
+            and status in ["WATCH", "BLOCK"]
+            and profit_ratio is not None
+            and float(profit_ratio) > 0
+            and defense is not None
+            and float(defense) > 0
+            and float(close_last) >= float(defense)
+        ):
+            pr_txt = f"{(float(profit_ratio) * 100.0):.1f}%"
+            out.append(
+                f"🟡【二階段下車：先減碼】出場燈 {status_zh}（風險分數 {score}），"
+                f"仍守住 {defense_name}（{float(defense):.2f}）。目前獲利 {pr_txt}；"
+                f"建議先賣一半，剩餘跌破 {defense_name} 再全出。"
+            )
+        elif score >= 2:
+            pr_txt = (
+                f"{(float(profit_ratio) * 100.0):.1f}%"
+                if profit_ratio is not None
+                else "NA"
+            )
+            out.append(
+                f"🟡【高位監控】出場燈轉為 {status_zh}（風險分數 {score}）。目前獲利 {pr_txt}。"
+                f"建議把「收盤跌破 {defense_name}」當作出場參考點。"
+            )
+        elif (
+            advice.resolution is not None
+            and advice.resolution.action
+            in (FinalAction.REDUCE, FinalAction.WATCH, FinalAction.EXIT)
+        ):
+            out.append(
+                f"⚠️【與主結論一致】{advice.resolution.summary_title}—此處沿用主結論的風控建議。"
+            )
+        else:
+            out.append("💎【獲利奔跑中】尚未觸發減碼／下車訊號，可續抱。")
+    else:
+        out.append(
+            "目前不是「出場燈號（top）」模式；要看這段白話下車指引，"
+            "建議在網頁把 TURN 切到 top，或勾選同時顯示 bottom + top。"
+        )
+
+    return "\n".join(out)
