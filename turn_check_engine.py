@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 from dataclasses import dataclass
 from typing import Dict, Tuple, Any, Optional
 
@@ -10,9 +12,66 @@ import copy
 # -------------------------
 # Config loader
 # -------------------------
-def load_turn_config(path: str = "turn_check_config.json") -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+# 主控台啟用「TURN 參數覆寫」時寫入；LINE／群組查詢讀此檔與網頁一致。
+# 雲端／多 instance 請用同一持久路徑（例如掛載磁碟），見環境變數 TURN_RUNTIME_SNAPSHOT_PATH。
+TURN_RUNTIME_SNAPSHOT_PATH = os.getenv(
+    "TURN_RUNTIME_SNAPSHOT_PATH", "turn_check_runtime.json"
+)
+
+
+def load_turn_config(
+    path: str = "turn_check_config.json",
+    *,
+    prefer_runtime_snapshot: bool = False,
+    runtime_path: str = TURN_RUNTIME_SNAPSHOT_PATH,
+) -> Dict[str, Any]:
+    """
+    讀取 TURN 設定。
+    prefer_runtime_snapshot=True：若存在 runtime_path（網頁覆寫快照），整份採用（與主控台當下門檻一致）。
+    預設 runtime 路徑為 TURN_RUNTIME_SNAPSHOT_PATH（可由環境變數 TURN_RUNTIME_SNAPSHOT_PATH 覆寫）。
+    快照讀取失敗（半寫入、JSON 損毀等）時退回 path 主設定檔。
+    """
+    def _load_file(p: str) -> Dict[str, Any]:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    if prefer_runtime_snapshot and runtime_path and os.path.isfile(runtime_path):
+        try:
+            return _load_file(runtime_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    return _load_file(path)
+
+
+def save_turn_runtime_snapshot(
+    cfg: Dict[str, Any], path: str = TURN_RUNTIME_SNAPSHOT_PATH
+) -> None:
+    """將主控台當下的 turn_cfg_runtime 寫入檔案（同目錄 tempfile + os.replace，避免讀到半寫入）。"""
+    abs_path = os.path.abspath(path)
+    target_dir = os.path.dirname(abs_path) or "."
+    os.makedirs(target_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        suffix=".json", prefix="._turn_runtime_", dir=target_dir
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=True) as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, abs_path)
+    except BaseException:
+        try:
+            if os.path.isfile(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def clear_turn_runtime_snapshot(path: str = TURN_RUNTIME_SNAPSHOT_PATH) -> None:
+    """關閉覆寫時刪除快照，LINE 等改回讀 turn_check_config.json。"""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # -------------------------

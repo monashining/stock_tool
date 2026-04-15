@@ -13,6 +13,7 @@ from line_push_formatter import (
     fuse_one_line_verdict_with_primary_risk,
     normalize_entry_reason,
     scrub_line_push_engineering_terms,
+    strip_embedded_verdict_block_from_expert_plain,
     strip_redundant_stock_name_from_line_expert_text,
     truncate_line_push,
     ultra_compact_one_line,
@@ -312,7 +313,7 @@ def test_strip_redundant_stock_name_from_line_expert_text():
 
 
 def test_build_line_push_reader_plain_three_sections():
-    """一般版：主結論／建倉一句／下車指南／專家，不出現 TURN bottom｜ALLOW。"""
+    """一般版：專家置頂、主結論、建倉、下車；不出現 TURN bottom｜ALLOW。"""
     d = ResolvedDecision(
         action=FinalAction.HOLD,
         color=FinalColor.GREEN,
@@ -359,6 +360,9 @@ def test_build_line_push_reader_plain_three_sections():
     assert "回檔" in text
     assert "📍 下車指南" in text
     assert "咸魚翻身｜AI 專家診斷" in text
+    assert text.index("咸魚翻身｜AI 專家診斷") < text.index("🟢")
+    assert text.index("咸魚翻身｜AI 專家診斷") < text.index("📍 下車指南")
+    assert text.index("🟢") < text.index("🚩 建倉建議：")
     assert "補充：TURN bottom" not in text
     assert "ALLOW 3/4" not in text
     assert "出場燈號與風險分數" in text
@@ -416,9 +420,18 @@ def test_build_line_push_reader_plain_expert_omits_duplicate_company_name():
         entry_volume_spike=False,
     )
     assert long_name in text.split("咸魚翻身｜AI 專家診斷")[0]
-    expert_block = text.split("咸魚翻身｜AI 專家診斷", 1)[1]
-    assert "ChipMOS" not in expert_block
-    assert "觀望保守：評分 44" in expert_block
+    mid = text.split("咸魚翻身｜AI 專家診斷", 1)[1]
+    before_entry = mid.split("🚩 建倉建議：", 1)[0]
+    assert "ChipMOS" not in before_entry
+    assert "觀望保守：評分 44" in before_entry
+
+
+def test_strip_embedded_verdict_block_from_expert_plain():
+    verdict = "🟠 減碼｜執行保護未通過\n標的狀態：弱\n診斷分數（參考）：76"
+    expert = "趨勢穩定：好。\n\n" + verdict
+    out = strip_embedded_verdict_block_from_expert_plain(expert, verdict)
+    assert verdict not in out
+    assert "趨勢穩定：好。" in out
 
 
 def test_build_line_push_payload_turn_from_dict():

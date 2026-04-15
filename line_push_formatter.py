@@ -432,6 +432,60 @@ def build_main_conclusion_push_text(
     return "\n".join(lines)
 
 
+def split_reader_plain_main_header_and_verdict(main: str) -> tuple[str, str]:
+    """
+    將 build_main_conclusion_push_text 產出拆成：
+    - header：【代碼】名稱 + 收盤參考（兩行）
+    - verdict：燈號標題／標的狀態／說明／診斷分數等其餘主結論內容
+    """
+    lines = (main or "").split("\n")
+    if len(lines) < 2:
+        return ((main or "").strip(), "")
+    header = "\n".join(lines[:2]).strip()
+    rest = lines[2:]
+    while rest and not (rest[0] or "").strip():
+        rest = rest[1:]
+    verdict = "\n".join(rest).strip()
+    return header, verdict
+
+
+def strip_embedded_verdict_block_from_expert_plain(
+    expert_plain: str, verdict: str
+) -> str:
+    """若專家全文內誤含與主結論 verdict 相同整段，移除（保留專家講評本體）。"""
+    s = (expert_plain or "").strip()
+    v = (verdict or "").strip()
+    if len(v) < 12 or not s:
+        return s
+    if v in s:
+        s = s[: s.find(v)].rstrip()
+    return s.strip()
+
+
+def strip_trailing_duplicate_expert_action_from_plain(
+    expert_plain: str, verdict: str
+) -> str:
+    """
+    generate_expert_advice 常在文末附「---」+ 行動句；主結論 verdict 已含同一句時刪除專家段尾重複。
+    """
+    s = (expert_plain or "").strip()
+    v = (verdict or "").strip()
+    if not s or not v:
+        return s
+    for sep in ("\n\n---\n", "\n---\n", "\n\n---", "\n---"):
+        if sep not in s:
+            continue
+        head, tail = s.rsplit(sep, 1)
+        tail = tail.strip()
+        if not tail:
+            s = head.strip()
+            continue
+        if tail in v or any(line.strip() == tail for line in v.split("\n") if line.strip()):
+            s = head.strip()
+            break
+    return s.strip()
+
+
 def build_line_push_reader_plain(
     *,
     ticker: str,
@@ -458,8 +512,8 @@ def build_line_push_reader_plain(
     max_chars: int = LINE_PUSH_MAX_CHARS,
 ) -> str:
     """
-    一般使用者版 LINE：主結論 → 建倉一句話 → 下車指南 → 咸魚翻身｜AI 專家診斷，
-    不含 TURN 代碼列、used_map 風險條、精準診斷儀表板全文。
+    一般使用者版 LINE：標的列＋收盤 → 咸魚翻身｜AI 專家診斷（置頂）→ 主結論其餘
+    → 建倉一句話 → 下車指南；不含 TURN 代碼列、used_map 風險條、精準診斷儀表板全文。
     """
     main = build_main_conclusion_push_text(
         ticker=ticker,
@@ -469,6 +523,7 @@ def build_line_push_reader_plain(
         has_position=has_position,
         decision=decision,
     )
+    header, verdict = split_reader_plain_main_header_and_verdict(main)
     entry_line = build_entry_advice_one_line_for_push(
         gate_ok=bool(entry_gate_ok),
         trigger_ok=bool(entry_trigger_ok),
@@ -491,22 +546,22 @@ def build_line_push_reader_plain(
             section_heading=READER_LINE_HEADING_EXIT,
         )
     )
+    expert_plain = strip_markdown_for_line_push(expert_msg)
+    expert_plain = scrub_line_push_engineering_terms(expert_plain)
     expert_plain = strip_redundant_stock_name_from_line_expert_text(
-        scrub_line_push_engineering_terms(
-            strip_markdown_for_line_push(expert_msg)
-        ),
-        name=str(name or "").strip(),
+        expert_plain, name=str(name or "").strip()
     )
-    body = "\n".join(
-        [
-            main,
-            "",
-            entry_line,
-            "",
-            exit_txt,
-            "",
-            READER_LINE_HEADING_EXPERT,
-            expert_plain or "（無）",
-        ]
-    )
+    expert_plain = strip_embedded_verdict_block_from_expert_plain(expert_plain, verdict)
+    expert_plain = strip_trailing_duplicate_expert_action_from_plain(expert_plain, verdict)
+    expert_plain = (expert_plain or "").strip()
+    parts_out: List[str] = [
+        header,
+        "",
+        READER_LINE_HEADING_EXPERT,
+        expert_plain or "（無）",
+    ]
+    if verdict:
+        parts_out.extend(["", verdict])
+    parts_out.extend(["", entry_line, "", exit_txt])
+    body = "\n".join(parts_out)
     return truncate_line_push(body, max_chars=max_chars)

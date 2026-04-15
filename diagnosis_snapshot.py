@@ -339,7 +339,9 @@ def build_line_diagnosis_snapshot(
 
     score = int(np.clip(weighted_score + context_score, 0, 100))
 
-    turn_cfg = load_turn_config(turn_cfg_path)
+    turn_cfg = load_turn_config(
+        turn_cfg_path, prefer_runtime_snapshot=True
+    )
     bottom_now = None
     top_now = None
     try:

@@ -373,7 +373,7 @@ def build_exit_guide_push_text(
                 else "NA"
             )
             out.append(
-                f"⚠️【強勢減碼】相對五日線乖離約 {bias_txt}，出場燈為 {status_zh}、風險分數 {score}。"
+                f"【強勢減碼】相對五日線乖離約 {bias_txt}，出場燈為 {status_zh}、風險分數 {score}。"
                 f"建議{partial_text}，剩餘持股守 {defense_name}。"
             )
         elif (
@@ -407,7 +407,7 @@ def build_exit_guide_push_text(
             in (FinalAction.REDUCE, FinalAction.WATCH, FinalAction.EXIT)
         ):
             out.append(
-                f"⚠️【與主結論一致】{advice.resolution.summary_title}—此處沿用主結論的風控建議。"
+                f"【與主結論一致】{advice.resolution.summary_title}—此處沿用主結論的風控建議。"
             )
         else:
             out.append("💎【獲利奔跑中】尚未觸發減碼／下車訊號，可續抱。")

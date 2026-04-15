@@ -1,6 +1,6 @@
 """
 群組查股：載入行情 → ResolvedDecision → PlainLanguageSummary。
-單檔：與網頁「一般版」LINE 相同，走 build_line_push_reader_plain（主結論／建倉一句／📍 下車指南／咸魚翻身｜AI 專家診斷）。
+單檔：與網頁「一般版」LINE 相同，走 build_line_push_reader_plain（標的＋收盤→咸魚翻身｜AI 專家診斷→主結論其餘／建倉一句／📍 下車指南）。
 多檔：精簡一行列示（與單檔精簡一句話＋主風險融合同源）。
 """
 from __future__ import annotations

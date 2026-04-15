@@ -9,13 +9,7 @@ import pandas as pd
 import streamlit as st
 
 from data_sources import fetch_last_price, fetch_fundamental_snapshot
-from final_decision_resolver import (
-    ACTION_UI,
-    FinalAction,
-    FinalColor,
-    ResolvedDecision,
-    group_reason_codes,
-)
+from final_decision_resolver import FinalAction, FinalColor, ResolvedDecision
 from plain_language_narrator import DipBuyVerdict, PlainLanguageSummary
 from position_advice import get_position_advice
 from tomorrow_guard_price import calc_tomorrow_guard
@@ -53,7 +47,7 @@ def render_plain_language_block(
     summary: PlainLanguageSummary,
     dip: DipBuyVerdict,
 ) -> None:
-    """頂卡下方：四行白話 + 撿便宜一句 + 術語對照。"""
+    """咸魚翻身區塊下方：四行白話 + 撿便宜一句 + 術語對照。"""
     with placeholder.container():
         st.markdown("### 🗣 白話翻譯")
         st.caption("把指標與裁決翻成可讀結論（不取代 ResolvedDecision）。")
@@ -77,47 +71,6 @@ def render_plain_language_block(
             with st.expander("術語對照（字典）", expanded=False):
                 for line in summary.term_notes:
                     st.markdown(f"- {line}")
-
-
-def render_page_top_conclusion(
-    placeholder: Any,
-    decision: Optional[ResolvedDecision],
-    *,
-    symbol: str = "",
-) -> None:
-    """
-    個股頁頂部主結論卡：僅使用 ResolvedDecision（與全站契約一致）。
-    第一行：燈號＋動作；第二行：state；第三行：summary_text；展開：分組原因＋ trace。
-    """
-    with placeholder.container():
-        st.markdown("### 主結論")
-        if symbol:
-            st.caption(symbol)
-        if decision is None:
-            st.info("資料不足，尚無法產生 ResolvedDecision。")
-            return
-
-        ui = ACTION_UI[decision.action]
-        st.markdown(f"## {ui['emoji']} **{ui['label']}** · {decision.summary_title}")
-        st.markdown(f"**{decision.state.value}**")
-        st.write(decision.summary_text)
-        st.caption(f"主因：`{decision.primary_reason.value}`")
-
-        groups = group_reason_codes(decision.reason_codes)
-        with st.expander("原因分組／追蹤 trace", expanded=False):
-            if groups.price_reasons:
-                st.markdown("**價格／結構**")
-                st.code(" / ".join(x.value for x in groups.price_reasons))
-            if groups.risk_reasons:
-                st.markdown("**風控**")
-                st.code(" / ".join(x.value for x in groups.risk_reasons))
-            if groups.narrative_reasons:
-                st.markdown("**建倉敘述／Gate·Trigger·Guard**")
-                st.code(" / ".join(x.value for x in groups.narrative_reasons))
-            if decision.trace_lines:
-                st.markdown("**trace**")
-                for line in decision.trace_lines:
-                    st.text(line)
 
 
 def render_position_advice_panel(
@@ -345,7 +298,7 @@ def render_position_advice_panel(
 
         closing_html = (
             '<p style="background:yellow; padding:6px 8px; border-radius:6px; margin:10px 0 0 0;">'
-            "⚠️ <b>注意：現在是收盤決策時間（13:00–13:35）！</b> 以「收盤是否守住防線」為最高權重。"
+            "<b>注意：現在是收盤決策時間（13:00–13:35）</b> 以「收盤是否守住防線」為最高權重。"
             "</p>"
             if is_closing_time
             else ""
@@ -388,7 +341,7 @@ def render_position_advice_panel(
                     prev_3d_high = hi.shift(1).rolling(3).max().iloc[-1]
                     if pd.notna(prev_3d_high) and float(cp) > float(prev_3d_high):
                         st.info(
-                            f"⚠️ 偵測到強勢回歸：價格突破近 3 日高點（{float(prev_3d_high):.2f}）。"
+                            f"偵測到強勢回歸：價格突破近 3 日高點（{float(prev_3d_high):.2f}）。"
                             "若你因 WATCH 已減碼，通常代表『洗盤後續攻』；可先取消再減碼念頭，改以防守線控風險。"
                         )
         except Exception:
@@ -689,7 +642,7 @@ def render_position_advice_panel(
         elif overheat:
             bias_txt = f"{(float(bias_ema5) * 100.0):.1f}%" if bias_ema5 is not None else "NA"
             st.warning(
-                f"⚠️ **【強勢減碼】** 乖離（相對 EMA5）約 {bias_txt}，且燈號={status}、分數={score}。"
+                f"**【強勢減碼】** 乖離（相對 EMA5）約 {bias_txt}，且燈號={status}、分數={score}。"
                 f"建議{partial_text}，剩餘持股守 {defense_name}。"
             )
         elif (
@@ -718,7 +671,7 @@ def render_position_advice_panel(
             in (FinalAction.REDUCE, FinalAction.WATCH, FinalAction.EXIT)
         ):
             st.warning(
-                f"⚠️ **【與最終決策一致】** {advice.resolution.summary_title} "
+                f"**【與最終決策一致】** {advice.resolution.summary_title} "
                 "（此處不以 top 分數覆蓋硬風控／AI／Guard 結論。）"
             )
         else:

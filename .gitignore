@@ -19,6 +19,9 @@ env/
 *.swp
 *.swo
 
+# 主控台 TURN 覆寫快照（本機與 LINE 對齊用，勿上傳）
+turn_check_runtime.json
+
 # 資料檔（含個人持倉，勿上傳）
 my_portfolio.csv
 

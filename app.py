@@ -61,7 +61,6 @@ from plain_language_narrator import (
     can_buy_the_dip,
 )
 from position_advice_ui import (
-    render_page_top_conclusion,
     render_plain_language_block,
     render_position_advice_panel,
 )
@@ -81,11 +80,13 @@ from final_decision_resolver import (
 from turn_check_ui import render_turn_check_panel
 from turn_check_engine import (
     backtest_turn_signals,
+    clear_turn_runtime_snapshot,
     grid_search_optimization,
     get_all_turn_details,
     get_all_turn_statuses,
     load_turn_config,
     run_turn_check,
+    save_turn_runtime_snapshot,
 )
 from tomorrow_guard_price import calc_tomorrow_guard
 from precision_diagnosis import diagnose_precision
@@ -153,7 +154,7 @@ st.set_page_config(page_title="Cursor 股票工具", layout="wide")
 load_dotenv()
 
 title_placeholder = st.empty()
-page_conclusion_placeholder = st.empty()
+expert_top_placeholder = st.empty()
 plain_language_placeholder = st.empty()
 expert_placeholder = st.empty()
 latest_metrics_placeholder = st.empty()
@@ -1055,6 +1056,11 @@ if page == "主控台":
     turn_sidebar_override = st.sidebar.checkbox(
         "啟用 TURN 參數覆寫（即時影響圖表/面板）", value=True
     )
+    st.sidebar.caption(
+        "覆寫**開**：寫入 TURN 快照檔（預設 `turn_check_runtime.json`），LINE／群組查詢與此頁同門檻；"
+        "覆寫**關**：刪除該檔，改讀 `turn_check_config.json`。"
+        " 雲端請設環境變數 `TURN_RUNTIME_SNAPSHOT_PATH` 指向持久磁碟上的同一路徑。"
+    )
     with st.sidebar.expander("核心門檻設定", expanded=False):
         allow_score = st.slider(
             "Bottom｜ALLOW 門檻（需達幾分）",
@@ -1299,6 +1305,10 @@ if page == "主控台":
         turn_cfg_runtime["top_trend_filter"]["block_score_add"] = int(top_trend_block_score_add)
     else:
         turn_cfg_runtime = turn_cfg_base
+    if turn_sidebar_override:
+        save_turn_runtime_snapshot(turn_cfg_runtime)
+    else:
+        clear_turn_runtime_snapshot()
 else:
     turn_cfg_runtime = turn_cfg_base
 
@@ -3379,7 +3389,7 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
     score = int(np.clip(weighted_score + context_score, 0, 100))
     reasons = weighted_reasons + context_reasons
 
-    # 頁面級 ResolvedDecision（頂部主結論卡與去留診斷共用，與下車指南同一套 TURN）
+    # 頁面級 ResolvedDecision（去留診斷條與下車指南同一套 TURN；主結論卡已移除改由頂部專家區呈現敘述）
     try:
         chip_foreign_3d_page = (
             float(foreign_net_series.dropna().tail(3).sum())
@@ -3470,11 +3480,30 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
             )
         )
 
-    render_page_top_conclusion(
-        page_conclusion_placeholder,
-        page_resolved_decision,
-        symbol=effective_symbol or "",
+    _expert_bottom_top = (
+        str(bottom_now_runtime.get("status", "NA"))
+        if isinstance(bottom_now_runtime, dict)
+        else "NA"
     )
+    expert_msg = generate_expert_advice(
+        df,
+        name,
+        score,
+        risk,
+        is_chip_divergence=foreign_divergence_warning,
+        weighted_ai_score=weighted_score,
+        bottom_status=_expert_bottom_top,
+    )
+    with expert_top_placeholder.container():
+        st.markdown("### 咸魚翻身｜AI 專家診斷")
+        render_conflict_warning(
+            foreign_divergence_warning, bool(latest.get("Is_Dangerous_Volume", False))
+        )
+        if latest.get("BUY_SIGNAL"):
+            st.success(expert_msg)
+        else:
+            st.info(expert_msg)
+        st.caption("分數門檻：≥70 留、40~69 減碼、<40 去")
 
     _bt_stat = (
         str(bottom_now_runtime.get("status", "NA"))
@@ -5289,34 +5318,6 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
                     else:
                         st.info("偏反彈或轉弱：目前屬於風險區，先保守觀察。")
 
-        st.markdown("### 咸魚翻身｜AI 專家診斷")
-        render_conflict_warning(
-            foreign_divergence_warning, bool(latest.get("Is_Dangerous_Volume", False))
-        )
-        _expert_bottom = "NA"
-        if isinstance(turn_result, dict):
-            if turn_result.get("mode") == "both" and isinstance(
-                turn_result.get("bottom"), dict
-            ):
-                _expert_bottom = str(turn_result["bottom"].get("status", "NA"))
-            elif str(turn_result.get("mode", "")) == "bottom":
-                _expert_bottom = str(turn_result.get("status", "NA"))
-
-        expert_msg = generate_expert_advice(
-            df,
-            name,
-            score,
-            risk,
-            is_chip_divergence=foreign_divergence_warning,
-            weighted_ai_score=weighted_score,
-            bottom_status=_expert_bottom,
-        )
-        if latest.get("BUY_SIGNAL"):
-            st.success(expert_msg)
-        else:
-            st.info(expert_msg)
-        st.caption("分數門檻：≥70 留、40~69 減碼、<40 去")
-
         # 與頂卡同一套 ResolvedDecision；標題／句型依是否持股切換（去留 vs 標的狀態）
         pos_cost = float(locals().get("pos_avg_cost", 0) or 0)
         has_pos = pos_cost > 0
@@ -5367,7 +5368,7 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
             horizontal=True,
             index=0,
             key="line_diagnosis_push_mode",
-            help="一般版：主結論、建倉一句、📍 下車指南、咸魚翻身｜AI 專家診斷（與網頁命名一致）；"
+            help="一般版：標的＋收盤→咸魚翻身｜AI 專家診斷（置頂）→主結論、建倉一句、📍 下車指南（與網頁命名一致）；"
             "下車指南依燈號與風險分數，不需輸入成本。不含 TURN 代碼與風險規則表。"
             "精簡／完整：保留給需要技術細節的使用者。",
         )
