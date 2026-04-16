@@ -3,6 +3,8 @@
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import pandas as pd
 
 from analysis import check_volume_risk
@@ -15,6 +17,12 @@ from final_decision_resolver import (
 from utils import to_scalar
 
 
+def _score_display(score, scoring_version: Optional[str]) -> str:
+    if scoring_version:
+        return f"{score}（模型 {scoring_version}）"
+    return str(score)
+
+
 def generate_expert_advice(
     df,
     ticker_name,
@@ -24,6 +32,7 @@ def generate_expert_advice(
     *,
     weighted_ai_score=None,
     bottom_status="NA",
+    scoring_version: Optional[str] = None,
 ):
     if df is None or df.empty or len(df) < 2:
         return "資料不足，無法產生專家講評。"
@@ -36,6 +45,7 @@ def generate_expert_advice(
 
     analysis = []
     display_name = ticker_name or "此標的"
+    sd = _score_display(score, scoring_version)
 
     is_dangerous_vol = bool(latest.get("Is_Dangerous_Volume"))
     is_pulling_out = is_dangerous_vol and is_chip_divergence
@@ -51,23 +61,23 @@ def generate_expert_advice(
 
     if chip_distribution:
         analysis.append(
-            f"**高檔派發中**：{display_name} 評分 {score}，但出現「乖離過熱（Bias20>15%）+ 籌碼背離」。"
+            f"**高檔派發中**：{display_name} 評分 {sd}，但出現「乖離過熱（Bias20>15%）+ 籌碼背離」。"
             "這種狀態常見於『外資趁強撤退、投信苦撐』，短線容易急殺洗盤。"
         )
     elif score >= 80:
-        analysis.append(f"**強力多頭配置**：{display_name} 評分高達 {score}，動能強勁。")
+        analysis.append(f"**強力多頭配置**：{display_name} 評分高達 {sd}，動能強勁。")
     elif score >= 60:
         if is_pulling_out:
             analysis.append(
-                f"**高度警戒**：{display_name} 評分 {score}，但偵測到「拉高出貨」徵兆（爆量黑K + 籌碼背離）。"
+                f"**高度警戒**：{display_name} 評分 {sd}，但偵測到「拉高出貨」徵兆（爆量黑K + 籌碼背離）。"
             )
         else:
             analysis.append(
-                f"**趨勢穩定**：{display_name} 評分 {score}，屬於標準多方形態。"
+                f"**趨勢穩定**：{display_name} 評分 {sd}，屬於標準多方形態。"
             )
     else:
         analysis.append(
-            f"**觀望保守**：{display_name} 評分 {score}，建議等待更明確的點火訊號。"
+            f"**觀望保守**：{display_name} 評分 {sd}，建議等待更明確的點火訊號。"
         )
 
     if body > 0 and lower_shadow > body * 1.5:

@@ -10,7 +10,10 @@ from line_push_formatter import (
     build_entry_advice_one_line_for_push,
     build_line_push_payload,
     build_line_push_reader_plain,
+    format_line_reader_diagnosis_score_line,
     fuse_one_line_verdict_with_primary_risk,
+    interpret_diagnosis_score_mood,
+    interpret_diagnosis_score_tier,
     normalize_entry_reason,
     scrub_line_push_engineering_terms,
     strip_embedded_verdict_block_from_expert_plain,
@@ -312,8 +315,21 @@ def test_strip_redundant_stock_name_from_line_expert_text():
     assert "觀望保守：評分 44" in out
 
 
+def test_interpret_diagnosis_score_helpers():
+    assert interpret_diagnosis_score_tier(88) == "強勢多頭"
+    assert interpret_diagnosis_score_tier(77) == "中等偏多"
+    assert interpret_diagnosis_score_tier(55) == "中性偏多"
+    assert interpret_diagnosis_score_tier(54) == "偏弱"
+    assert interpret_diagnosis_score_mood(bias20_pct=12.0) == "動能偏熱"
+    assert interpret_diagnosis_score_mood(bias20_pct=3.0) == "趨勢穩定"
+    assert interpret_diagnosis_score_mood(bias20_pct=None) == "趨勢穩定"
+    s = format_line_reader_diagnosis_score_line(77, bias20_pct=2.0)
+    assert s.startswith("診斷分數：77（中等偏多，趨勢穩定）")
+    assert "模型" in s
+
+
 def test_build_line_push_reader_plain_three_sections():
-    """一般版：專家置頂、主結論、建倉、下車；不出現 TURN bottom｜ALLOW。"""
+    """一般版：專家置頂、診斷分數、建倉、下車；不出現 TURN bottom｜ALLOW；不含燈號主結論段。"""
     d = ResolvedDecision(
         action=FinalAction.HOLD,
         color=FinalColor.GREEN,
@@ -356,13 +372,14 @@ def test_build_line_push_reader_plain_three_sections():
         entry_volume_spike=False,
     )
     assert "收盤參考：" in text
+    assert "診斷分數：88（強勢多頭，趨勢穩定）（模型" in text
     assert "🚩 建倉建議：" in text
     assert "回檔" in text
     assert "📍 下車指南" in text
     assert "咸魚翻身｜AI 專家診斷" in text
-    assert text.index("咸魚翻身｜AI 專家診斷") < text.index("🟢")
+    assert "🟢" not in text
     assert text.index("咸魚翻身｜AI 專家診斷") < text.index("📍 下車指南")
-    assert text.index("🟢") < text.index("🚩 建倉建議：")
+    assert text.index("診斷分數：") < text.index("🚩 建倉建議：")
     assert "補充：TURN bottom" not in text
     assert "ALLOW 3/4" not in text
     assert "出場燈號與風險分數" in text

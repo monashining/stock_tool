@@ -1,3 +1,10 @@
+import os
+import pickle
+import threading
+import time
+from pathlib import Path
+from typing import Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import pandas_ta_classic as ta
@@ -5,6 +12,158 @@ import streamlit as st
 import yfinance as yf
 
 from utils import normalize_net_series_to_lot, safe_float
+
+# 程序內記憶體快取（跨 Streamlit cache_data 與直接呼叫 _load_data_raw 共用），
+# 降低 yfinance 頻率與 rate limit；**不同 process**（Web 與 LINE worker）仍各自一份。
+_OHLCV_MEM_LOCK = threading.Lock()
+_OHLCV_MEM_CACHE: dict[Tuple[str, ...], tuple[float, pd.DataFrame]] = {}
+# 週線趨勢字串（多頭/空頭/未知）專用
+_WEEKLY_STR_MEM_CACHE: dict[Tuple[str, ...], tuple[float, str]] = {}
+
+_YF_DISK_LOCK = threading.Lock()
+
+
+def _read_env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+        return v if np.isfinite(v) and v >= 0 else default
+    except ValueError:
+        return default
+
+
+def yf_mem_cache_ttl_sec() -> float:
+    """環境變數 YF_MEM_CACHE_TTL_SEC（秒），預設 60。"""
+    return _read_env_float("YF_MEM_CACHE_TTL_SEC", 60.0)
+
+
+def yf_disk_cache_ttl_sec() -> float:
+    """環境變數 YF_DISK_CACHE_TTL_SEC（秒），預設 60。"""
+    return _read_env_float("YF_DISK_CACHE_TTL_SEC", 60.0)
+
+
+def _yf_disk_cache_dir() -> Path:
+    raw = os.environ.get("YF_DISK_CACHE_DIR", "").strip()
+    if raw:
+        d = Path(raw).expanduser()
+        d.mkdir(parents=True, exist_ok=True)
+        return d.resolve()
+    d = Path(__file__).resolve().parent / "data" / ".yf_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _yf_disk_cache_path(key_parts: Tuple[str, ...]) -> Path:
+    safe = "__".join(
+        "".join(c if c.isalnum() or c in ".-_" else "_" for c in str(p))[:120]
+        for p in key_parts
+    )
+    return _yf_disk_cache_dir() / f"{safe}.pkl"
+
+
+def _yf_disk_blob_load(key_parts: Tuple[str, ...]) -> Optional[dict]:
+    path = _yf_disk_cache_path(key_parts)
+    if not path.is_file():
+        return None
+    try:
+        with _YF_DISK_LOCK, open(path, "rb") as f:
+            blob = pickle.load(f)
+        ts = float(blob.get("wall_ts", 0))
+        if time.time() - ts >= yf_disk_cache_ttl_sec():
+            return None
+        return blob if isinstance(blob, dict) else None
+    except Exception:
+        return None
+
+
+def _yf_disk_blob_write_atomic(key_parts: Tuple[str, ...], payload: dict) -> None:
+    path = _yf_disk_cache_path(key_parts)
+    tmp = path.with_suffix(".pkl.tmp")
+    blob = dict(payload)
+    blob["wall_ts"] = time.time()
+    try:
+        with _YF_DISK_LOCK, open(tmp, "wb") as f:
+            pickle.dump(blob, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if tmp.is_file():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _yf_disk_cache_read(key_parts: Tuple[str, ...]) -> Optional[pd.DataFrame]:
+    blob = _yf_disk_blob_load(key_parts)
+    if not blob:
+        return None
+    df = blob.get("df")
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    return df
+
+
+def _yf_disk_cache_write(key_parts: Tuple[str, ...], df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        return
+    _yf_disk_blob_write_atomic(key_parts, {"df": df.copy()})
+
+
+def _yf_disk_weekly_trend_read(key_parts: Tuple[str, ...]) -> Optional[str]:
+    blob = _yf_disk_blob_load(key_parts)
+    if not blob or "weekly_trend" not in blob:
+        return None
+    return str(blob["weekly_trend"])
+
+
+def _yf_disk_weekly_trend_write(key_parts: Tuple[str, ...], trend: str) -> None:
+    _yf_disk_blob_write_atomic(key_parts, {"weekly_trend": str(trend)})
+
+
+def _weekly_str_mem_get(key: Tuple[str, ...]) -> Optional[str]:
+    now = time.monotonic()
+    with _OHLCV_MEM_LOCK:
+        ent = _WEEKLY_STR_MEM_CACHE.get(key)
+        if not ent:
+            return None
+        ts, trend = ent
+        if now - ts > yf_mem_cache_ttl_sec():
+            try:
+                del _WEEKLY_STR_MEM_CACHE[key]
+            except KeyError:
+                pass
+            return None
+        return str(trend)
+
+
+def _weekly_str_mem_set(key: Tuple[str, ...], trend: str) -> None:
+    with _OHLCV_MEM_LOCK:
+        _WEEKLY_STR_MEM_CACHE[key] = (time.monotonic(), str(trend))
+
+
+def _ohlcv_mem_cache_get(key: Tuple[str, ...]) -> Optional[pd.DataFrame]:
+    now = time.monotonic()
+    with _OHLCV_MEM_LOCK:
+        ent = _OHLCV_MEM_CACHE.get(key)
+        if not ent:
+            return None
+        ts, df = ent
+        if now - ts > yf_mem_cache_ttl_sec():
+            try:
+                del _OHLCV_MEM_CACHE[key]
+            except KeyError:
+                pass
+            return None
+        return df
+
+
+def _ohlcv_mem_cache_set(key: Tuple[str, ...], df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        return
+    with _OHLCV_MEM_LOCK:
+        _OHLCV_MEM_CACHE[key] = (time.monotonic(), df.copy())
 
 try:
     from FinMind.data import DataLoader
@@ -285,16 +444,62 @@ def fetch_ticker_name(symbol: str):
     return None, candidates[0] if candidates else None
 
 
-@st.cache_data(ttl=300)
-def load_market_index(symbol):
-    if symbol.endswith(".TW") or symbol.endswith(".TWO") or symbol.isdigit():
-        index_symbol = "^TWII"
-    else:
-        index_symbol = "^GSPC"
-    mkt = yf.download(index_symbol, period="6mo", progress=False)
+# 大盤指數：台股一律 ^TWII（不依 input 字串變體），非台股 ^GSPC
+MARKET_INDEX_TWII = "^TWII"
+MARKET_INDEX_GSPC = "^GSPC"
+
+
+def _is_taiwan_equity_symbol(symbol: str) -> bool:
+    s = (symbol or "").strip()
+    return bool(s.endswith(".TW") or s.endswith(".TWO") or s.isdigit())
+
+
+def _load_market_index_ohlcv_with_meta(
+    index_symbol: str, *, period: str = "6mo"
+) -> tuple[pd.DataFrame, str]:
+    cache_key = ("mkt", index_symbol, period)
+    hit = _ohlcv_mem_cache_get(cache_key)
+    if hit is not None:
+        return hit.copy(), "mem"
+    disk = _yf_disk_cache_read(cache_key)
+    if disk is not None:
+        _ohlcv_mem_cache_set(cache_key, disk)
+        return disk.copy(), "disk"
+    mkt = yf.download(index_symbol, period=period, progress=False)
     if not mkt.empty and isinstance(mkt.columns, pd.MultiIndex):
         mkt.columns = [c[0] for c in mkt.columns]
-    return mkt, index_symbol
+    mkt = normalize_ohlcv(mkt)
+    if mkt is not None and not mkt.empty:
+        _ohlcv_mem_cache_set(cache_key, mkt)
+        _yf_disk_cache_write(cache_key, mkt)
+        return mkt, "net"
+    return mkt if mkt is not None else pd.DataFrame(), "net"
+
+
+def _load_market_index_ohlcv(index_symbol: str, *, period: str = "6mo") -> pd.DataFrame:
+    df, _layer = _load_market_index_ohlcv_with_meta(index_symbol, period=period)
+    return df
+
+
+def load_market_index_with_meta(
+    symbol: str = "",
+) -> tuple[pd.DataFrame, str, str]:
+    """
+    回傳 (大盤日線 DataFrame, 指數代號, cache_layer)。
+    cache_layer：mem / disk / net（與個股 OHLCV 同一套 mem+disk）。
+    """
+    idx = MARKET_INDEX_TWII if _is_taiwan_equity_symbol(str(symbol)) else MARKET_INDEX_GSPC
+    df, layer = _load_market_index_ohlcv_with_meta(idx)
+    return df, idx, layer
+
+
+def load_market_index(symbol: str = "") -> tuple[pd.DataFrame, str]:
+    """
+    回傳 (大盤日線 DataFrame, 指數代號)。
+    台股相關標的固定用 ^TWII；其餘用 ^GSPC。與個股 ticker 寫法無關，避免 TWII / ^TWII 混用。
+    """
+    df, idx, _layer = load_market_index_with_meta(symbol)
+    return df, idx
 
 
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
@@ -331,7 +536,31 @@ def _try_history(symbol, period):
         return pd.DataFrame()
 
 
-def _load_data_raw(symbol, period):
+def _normalize_symbol_for_cache(symbol: str) -> str:
+    """正規化股票代號，確保切換股票時 cache key 一致，避免吃到錯檔資料"""
+    if not symbol or not isinstance(symbol, str):
+        return str(symbol or "")
+    s = symbol.strip()
+    if not s:
+        return s
+    # 台股：純數字補上 .TW，避免 "2367" 與 "2367.TW" 產生不同 cache
+    if s.isdigit():
+        return f"{s}.TW"
+    return s
+
+
+def _load_data_raw_with_meta(symbol, period) -> tuple[pd.DataFrame, str]:
+    """回傳 (df, cache_layer)；layer 為 mem / disk / net。"""
+    # 與 load_data 的 symbol 正規化一致，避免 2367 / 2367.TW 打到不同快取槽
+    mem_key = (_normalize_symbol_for_cache(str(symbol or "")), str(period or "1y"))
+    cached = _ohlcv_mem_cache_get(mem_key)
+    if cached is not None:
+        return cached.copy(), "mem"
+    disk_df = _yf_disk_cache_read(mem_key)
+    if disk_df is not None:
+        _ohlcv_mem_cache_set(mem_key, disk_df)
+        return disk_df.copy(), "disk"
+
     fetch_period = "5y" if period == "5y" else "1y"
     df = _try_download(symbol, fetch_period)
     if df.empty and symbol.endswith(".TW"):
@@ -352,7 +581,7 @@ def _load_data_raw(symbol, period):
         df = _try_download(symbol, fetch_period, threads=False)
     df = normalize_ohlcv(df)
     if df is None or df.empty:
-        return df
+        return df, "net"
     period_map = {
         "1mo": 22,
         "3mo": 63,
@@ -360,36 +589,37 @@ def _load_data_raw(symbol, period):
         "1y": 252,
     }
     if period in period_map:
-        return df.tail(period_map[period])
+        df = df.tail(period_map[period])
+    _ohlcv_mem_cache_set(mem_key, df)
+    _yf_disk_cache_write(mem_key, df)
+    return df.copy(), "net"
+
+
+def _load_data_raw(symbol, period):
+    df, _layer = _load_data_raw_with_meta(symbol, period)
     return df
-
-
-def _normalize_symbol_for_cache(symbol: str) -> str:
-    """正規化股票代號，確保切換股票時 cache key 一致，避免吃到錯檔資料"""
-    if not symbol or not isinstance(symbol, str):
-        return str(symbol or "")
-    s = symbol.strip()
-    if not s:
-        return s
-    # 台股：純數字補上 .TW，避免 "2367" 與 "2367.TW" 產生不同 cache
-    if s.isdigit():
-        return f"{s}.TW"
-    return s
 
 
 @st.cache_data(ttl=300)  # 盤中 5 分鐘更新；用正規化 symbol 當 key，切換股票會正確取新資料
 def _load_data_cached(normalized_symbol: str, period: str):
-    """內部：cache 以 normalized_symbol 為 key，確保 2367 與 2367.TW 共用同一筆"""
-    df = _load_data_raw(normalized_symbol, period)
+    """內部：cache 以 normalized_symbol 為 key；一併快取本次命中的 cache_layer。"""
+    df, layer = _load_data_raw_with_meta(normalized_symbol, period)
     if df is None or df.empty:
-        return df
+        return df, layer
     # 回傳 copy，避免 caller 對 df 的修改污染 cache
-    return df.copy()
+    return df.copy(), layer
+
+
+def load_data_with_meta(symbol, period) -> tuple[pd.DataFrame, str]:
+    """與 load_data 相同資料，另回傳本次載入的 cache_layer（mem/disk/net）。"""
+    norm = _normalize_symbol_for_cache(str(symbol or ""))
+    return _load_data_cached(norm, period)
 
 
 def load_data(symbol, period):
     norm = _normalize_symbol_for_cache(str(symbol or ""))
-    return _load_data_cached(norm, period)
+    df, _layer = _load_data_cached(norm, period)
+    return df
 
 
 @st.cache_data(ttl=300)
@@ -434,11 +664,35 @@ def load_data_batch(symbols, period="1y"):
     return out
 
 
-@st.cache_data(ttl=3600)
-def get_weekly_trend(symbol):
-    w_df = yf.download(symbol, period="1y", interval="1wk", progress=False)
-    if w_df.empty or len(w_df) < 5:
+def _fetch_weekly_ohlcv_for_trend(symbol: str) -> pd.DataFrame:
+    """週線 OHLCV：與日線類似做代號後備，失敗回傳空 DataFrame。"""
+    sym = str(symbol or "").strip()
+    norm = _normalize_symbol_for_cache(sym)
+
+    def _one(s: str) -> pd.DataFrame:
+        w_df = yf.download(s, period="1y", interval="1wk", progress=False)
+        if w_df is None or w_df.empty:
+            return pd.DataFrame()
+        return w_df
+
+    w_df = _one(norm)
+    if not w_df.empty:
+        return w_df
+    if norm.endswith(".TW"):
+        w_df = _one(norm.replace(".TW", ".TWO"))
+        if not w_df.empty:
+            return w_df
+    if sym and sym != norm:
+        w_df = _one(sym)
+        if not w_df.empty:
+            return w_df
+    return pd.DataFrame()
+
+
+def _compute_weekly_label_from_wdf(w_df: pd.DataFrame) -> str:
+    if w_df is None or w_df.empty or len(w_df) < 5:
         return "未知"
+    w_df = w_df.copy()
     if isinstance(w_df.columns, pd.MultiIndex):
         w_df.columns = [col[0] for col in w_df.columns]
     w_ema10 = ta.ema(w_df["Close"], length=10)
@@ -446,4 +700,32 @@ def get_weekly_trend(symbol):
         return "未知"
     w_close = w_df["Close"].iloc[-1]
     w_ema10_last = w_ema10.iloc[-1]
+    if pd.isna(w_close) or pd.isna(w_ema10_last):
+        return "未知"
     return "多頭" if w_close > w_ema10_last else "空頭"
+
+
+def get_weekly_trend_with_meta(symbol: str) -> Tuple[str, str]:
+    """
+    週線趨勢字串 + 快取層級（mem / disk / net）。
+    與日線 OHLCV 相同：程序內記憶體 → 磁碟 pickle → yfinance。
+    """
+    norm = _normalize_symbol_for_cache(str(symbol or ""))
+    key: Tuple[str, ...] = ("wk", norm, "1y_1wk")
+    mem_hit = _weekly_str_mem_get(key)
+    if mem_hit is not None:
+        return mem_hit, "mem"
+    disk_hit = _yf_disk_weekly_trend_read(key)
+    if disk_hit is not None:
+        _weekly_str_mem_set(key, disk_hit)
+        return disk_hit, "disk"
+    w_df = _fetch_weekly_ohlcv_for_trend(symbol)
+    trend = _compute_weekly_label_from_wdf(w_df)
+    _weekly_str_mem_set(key, trend)
+    _yf_disk_weekly_trend_write(key, trend)
+    return trend, "net"
+
+
+def get_weekly_trend(symbol: str) -> str:
+    """相容舊介面：僅回傳趨勢字串。"""
+    return get_weekly_trend_with_meta(symbol)[0]

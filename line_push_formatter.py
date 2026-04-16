@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Literal, Optional
 
+from diagnosis_scoring import SCORING_VERSION
 from final_decision_resolver import (
     ACTION_UI,
     ResolvedDecision,
@@ -38,6 +39,45 @@ PRIMARY_RISK_CATEGORY_SHORT_LABEL: Dict[str, str] = {
     "Trigger": "上漲力道",
     "Chip Notes": "籌碼",
 }
+
+
+def interpret_diagnosis_score_tier(score: int) -> str:
+    """診斷總分（0–100）粗分層，供一般版 LINE 一句話解讀。"""
+    s = int(score)
+    if s >= 85:
+        return "強勢多頭"
+    if s >= 70:
+        return "中等偏多"
+    if s >= 55:
+        return "中性偏多"
+    return "偏弱"
+
+
+def interpret_diagnosis_score_mood(*, bias20_pct: Optional[float]) -> str:
+    """搭配 Bias20（%）的第二語，避免每則訊息過長。"""
+    if bias20_pct is None:
+        return "趨勢穩定"
+    try:
+        b = float(bias20_pct)
+    except (TypeError, ValueError):
+        return "趨勢穩定"
+    if b != b or abs(b) == float("inf"):
+        return "趨勢穩定"
+    if b > 10:
+        return "動能偏熱"
+    if b < -8:
+        return "動能偏冷"
+    return "趨勢穩定"
+
+
+def format_line_reader_diagnosis_score_line(
+    score: int, *, bias20_pct: Optional[float]
+) -> str:
+    tier = interpret_diagnosis_score_tier(score)
+    mood = interpret_diagnosis_score_mood(bias20_pct=bias20_pct)
+    return (
+        f"診斷分數：{int(score)}（{tier}，{mood}）（模型 {SCORING_VERSION}）"
+    )
 
 
 def fuse_one_line_verdict_with_primary_risk(
@@ -415,7 +455,7 @@ def build_main_conclusion_push_text(
     lines = [" ".join(parts).strip(), f"收盤參考：{close_price:.2f}", ""]
     if decision is None:
         lines.append("資料不足，尚無法產生主結論。")
-        lines.append(f"診斷分數（參考）：{score}")
+        lines.append(f"診斷分數（參考）：{score}（模型 {SCORING_VERSION}）")
         return "\n".join(lines)
     ui = ACTION_UI[decision.action]
     title = get_status_bar_title(has_position)
@@ -428,7 +468,7 @@ def build_main_conclusion_push_text(
     ea = strip_markdown_for_line_push(decision.expert_action_line or "")
     if ea and ea not in st:
         lines.append(ea)
-    lines.append(f"診斷分數（參考）：{score}")
+    lines.append(f"診斷分數（參考）：{score}（模型 {SCORING_VERSION}）")
     return "\n".join(lines)
 
 
@@ -512,8 +552,9 @@ def build_line_push_reader_plain(
     max_chars: int = LINE_PUSH_MAX_CHARS,
 ) -> str:
     """
-    一般使用者版 LINE：標的列＋收盤 → 咸魚翻身｜AI 專家診斷（置頂）→ 主結論其餘
+    一般使用者版 LINE：標的列＋收盤 → 咸魚翻身｜AI 專家診斷（置頂）→ 診斷分數一行
     → 建倉一句話 → 下車指南；不含 TURN 代碼列、used_map 風險條、精準診斷儀表板全文。
+    不含「燈號＋續抱/減碼｜主結論標題」整段（與專家敘述重疊，已由產品決定省略）。
     """
     main = build_main_conclusion_push_text(
         ticker=ticker,
@@ -559,9 +600,11 @@ def build_line_push_reader_plain(
         "",
         READER_LINE_HEADING_EXPERT,
         expert_plain or "（無）",
+        "",
+        format_line_reader_diagnosis_score_line(
+            int(score), bias20_pct=entry_bias20_pct
+        ),
     ]
-    if verdict:
-        parts_out.extend(["", verdict])
     parts_out.extend(["", entry_line, "", exit_txt])
     body = "\n".join(parts_out)
     return truncate_line_push(body, max_chars=max_chars)

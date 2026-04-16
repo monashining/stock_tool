@@ -10,20 +10,14 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 
-from analysis import (
-    compute_buy_signals,
-    compute_indicators,
-    compute_risk_metrics,
-    compute_volume_sum_3d,
-    compute_weighted_score,
-)
+from analysis import compute_buy_signals, compute_indicators, compute_risk_metrics
+from diagnosis_scoring import SCORING_VERSION, compute_diagnosis_score_bundle
 from data_sources import (
-    _load_data_raw,
-    fetch_ticker_name,
+    _load_data_raw_with_meta,
     fetch_foreign_net_series,
+    fetch_ticker_name,
     fetch_trust_net_series,
-    get_weekly_trend,
-    load_data,
+    load_data_with_meta,
     load_market_index,
 )
 from expert_advice_text import generate_expert_advice
@@ -80,9 +74,9 @@ def build_line_diagnosis_snapshot(
     name, resolved = fetch_ticker_name(effective_symbol)
     sym = resolved or effective_symbol.strip()
 
-    df = load_data(sym, time_range)
+    df, daily_cache_layer = load_data_with_meta(sym, time_range)
     if df is None or df.empty:
-        df = _load_data_raw(sym, time_range)
+        df, daily_cache_layer = _load_data_raw_with_meta(sym, time_range)
     if df is None or df.empty:
         raise ValueError(f"無法取得行情：{sym}")
 
@@ -90,7 +84,7 @@ def build_line_diagnosis_snapshot(
     df = compute_indicators(df)
     df = compute_buy_signals(df)
 
-    df_risk = load_data(sym, "1y")
+    df_risk, _ = load_data_with_meta(sym, "1y")
     if df_risk is None or df_risk.empty:
         df_risk = df
     mkt_df, _idx_sym = load_market_index(sym)
@@ -156,188 +150,36 @@ def build_line_diagnosis_snapshot(
     ema20 = to_scalar(ema_latest["EMA20"])
     ema5 = to_scalar(ema_latest["EMA5"])
 
-    is_high_volume_sell = False
-    if ema20 is not None and ema5 is not None and not pd.isna(avg_vol_5):
-        is_high_price = close_price > ema20 * 1.05
-        is_huge_vol = current_vol > avg_vol_5 * 2
-        is_selling_pressure = close_price < to_scalar(df["Open"].iloc[-1])
-        is_high_volume_sell = is_high_price and is_huge_vol and is_selling_pressure
+    foreign_net_latest = None
+    if foreign_net_series is not None and not foreign_net_series.empty:
+        foreign_net_latest = foreign_net_series.iloc[-1]
 
-    weighted_score, _weighted_reasons, _weighted_flags = compute_weighted_score(
+    _score_bundle = compute_diagnosis_score_bundle(
+        df,
+        ema_df,
+        latest=latest_row,
         ema20=ema20,
         ema5=ema5,
         close_price=close_price,
         current_vol=current_vol,
         avg_vol_5=avg_vol_5,
         bias_20_val=bias_20_val,
+        vol_ma20_val=vol_ma20_val,
+        sma20_val=sma20_val,
+        sma60_val=sma60_val,
+        atr14_val=atr14_val,
+        latest_volume=latest_volume,
+        latest_close=latest_close,
         foreign_net_series=foreign_net_series,
         trust_net_series=trust_net_series,
-        vol_sum_3d=compute_volume_sum_3d(df),
-        is_dangerous_vol=bool(latest_row.get("Is_Dangerous_Volume", False)),
+        foreign_net_latest=foreign_net_latest,
+        market_symbol=sym,
+        foreign_divergence_warning=foreign_divergence_warning,
+        daily_cache_layer=daily_cache_layer,
+        period_tag=f"{time_range}_1d",
     )
-
-    context_score = 0
-    ema20_up = None
-    if ema20 is not None and len(ema_df) >= 2:
-        ema20_up = to_scalar(ema_df["EMA20"].iloc[-1]) > to_scalar(
-            ema_df["EMA20"].iloc[-2]
-        )
-    if ema20 is None or ema20_up is None:
-        pass
-    elif close_price > ema20 and ema20_up:
-        context_score += 1
-    else:
-        context_score -= 1
-
-    if ema5 is None or ema20 is None:
-        pass
-    elif ema5 > ema20:
-        context_score += 1
-    else:
-        context_score -= 1
-
-    if not pd.isna(df["RSI14"].iloc[-1]):
-        rsi_latest = to_scalar(df["RSI14"].iloc[-1])
-        if rsi_latest >= 50:
-            context_score += 1
-
-    foreign_net_latest = None
-    if foreign_net_series is not None and not foreign_net_series.empty:
-        foreign_net_latest = foreign_net_series.iloc[-1]
-        if foreign_net_latest > 0:
-            context_score += 1
-
-    trend_mid_ok = (
-        not pd.isna(sma20_val)
-        and not pd.isna(sma60_val)
-        and sma20_val > sma60_val
-    )
-    if trend_mid_ok:
-        context_score += 1
-
-    sma60_up = False
-    if len(df) >= 6:
-        sma60_now = df["SMA60"].iloc[-1]
-        sma60_prev = df["SMA60"].iloc[-6]
-        if not pd.isna(sma60_now) and not pd.isna(sma60_prev):
-            sma60_up = sma60_now > sma60_prev
-            if sma60_up:
-                context_score += 1
-
-    vol_ratio_20 = None
-    if not pd.isna(vol_ma20_val) and vol_ma20_val > 0:
-        vol_ratio_20 = latest_volume / vol_ma20_val
-
-    if (
-        trigger_type == "BREAKOUT"
-        and vol_ratio_20 is not None
-        and 1.2 <= vol_ratio_20 <= 1.8
-    ):
-        context_score += 1
-
-    if len(df) >= 3:
-        last2_vol = df["Volume"].tail(2)
-        last2_vol_ma = df["VolMA20"].tail(2)
-        last2_close = df["Close"].tail(2)
-        last2_ema20 = df["EMA20"].tail(2)
-        if (
-            (last2_vol < last2_vol_ma).all()
-            and (last2_close >= last2_ema20).all()
-        ):
-            context_score += 1
-
-    if len(df) >= 21:
-        ret_stock_20d = (df["Close"].iloc[-1] / df["Close"].iloc[-21]) - 1
-        if len(mkt_df) >= 21:
-            ret_mkt_20d = (mkt_df["Close"].iloc[-1] / mkt_df["Close"].iloc[-21]) - 1
-            if ret_stock_20d > ret_mkt_20d:
-                context_score += 1
-
-    if atr14_val is not None and not pd.isna(atr14_val) and latest_close > 0:
-        atr_pct = atr14_val / latest_close
-        if 0.01 <= atr_pct <= 0.05:
-            context_score += 1
-
-    if len(df) >= 20:
-        low_recent = df["Low"].tail(10).min()
-        low_prev = df["Low"].shift(10).tail(10).min()
-        if not pd.isna(low_recent) and not pd.isna(low_prev) and low_recent > low_prev:
-            context_score += 1
-
-    weekly_status = get_weekly_trend(sym)
-    if weekly_status == "多頭":
-        context_score += 1
-    elif weekly_status == "空頭":
-        context_score -= 1
-
-    if len(ema_df) >= 3 and ema20 is not None:
-        last3 = ema_df.tail(3)
-        below_ema20 = (last3["Close"] < last3["EMA20"]).all()
-        if below_ema20:
-            context_score -= 1
-
-    prior_high = None
-    if "High" in df.columns and len(df) >= 2:
-        prior_high = to_scalar(df["High"].shift(1).rolling(20).max().iloc[-1])
-        if not pd.isna(prior_high):
-            if close_price > prior_high:
-                context_score += 1
-
-    if ema5 is not None:
-        if close_price < ema5:
-            context_score -= 1
-        if len(ema_df) >= 3:
-            last3 = ema_df.tail(3)
-            below_ema5 = (last3["Close"] < last3["EMA5"]).all()
-            if below_ema5:
-                context_score -= 1
-
-    if is_high_volume_sell:
-        context_score -= 3
-
-    is_dangerous_volume = bool(latest_row.get("Is_Dangerous_Volume", False))
-    if is_dangerous_volume:
-        context_score -= 2
-
-    if bias_20_val is not None and not pd.isna(bias_20_val) and bias_20_val > 10:
-        context_score -= 2
-
-    if len(df) >= 2:
-        last2 = df.tail(2)
-        upper_wick = last2["High"] - last2[["Open", "Close"]].max(axis=1)
-        k_range = last2["High"] - last2["Low"]
-        wick_ratio = upper_wick / k_range.replace(0, np.nan)
-        if (wick_ratio > 0.5).all():
-            context_score -= 1
-
-    if prior_high is not None:
-        if latest_row["High"] > prior_high and close_price < prior_high:
-            context_score -= 2
-
-    if ema20 is not None and vol_ratio_20 is not None:
-        if close_price < ema20 and vol_ratio_20 > 1.3:
-            context_score -= 2
-
-    if len(df) >= 2:
-        prev_row = df.iloc[-2]
-        if (
-            latest_row["Open"] > prev_row["High"] * 1.01
-            and latest_row["Low"] < prev_row["Close"]
-        ):
-            context_score -= 1
-
-    if weekly_status == "空頭":
-        context_score -= 2
-
-    if foreign_divergence_warning:
-        context_score -= 1
-
-    if foreign_net_series is not None and len(foreign_net_series) >= 3:
-        recent_foreign_sum = foreign_net_series.tail(3).sum()
-        if recent_foreign_sum <= -5000:
-            context_score -= 2
-
-    score = int(np.clip(weighted_score + context_score, 0, 100))
+    weighted_score = _score_bundle.weighted_score
+    score = _score_bundle.total_score
 
     turn_cfg = load_turn_config(
         turn_cfg_path, prefer_runtime_snapshot=True
@@ -418,6 +260,7 @@ def build_line_diagnosis_snapshot(
         is_chip_divergence=foreign_divergence_warning,
         weighted_ai_score=weighted_score,
         bottom_status=_expert_bottom,
+        scoring_version=SCORING_VERSION,
     )
 
     return LineDiagnosisSnapshot(

@@ -31,4 +31,8 @@ data/portfolio/*.parquet
 !data/portfolio/.gitkeep
 data/*.db
 
+# yfinance 跨 process 檔案快取（可刪；勿提交二進位快取）
+data/.yf_cache/*.pkl
+!data/.yf_cache/.gitkeep
+
 tools/*.exe

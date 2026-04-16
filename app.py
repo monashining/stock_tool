@@ -26,9 +26,11 @@ from analysis import (
     compute_weighted_score,
     estimate_target_range,
 )
+from diagnosis_scoring import SCORING_VERSION, compute_diagnosis_score_bundle
 from data_sources import (
     FINMIND_AVAILABLE,
     _load_data_raw,
+    _load_data_raw_with_meta,
     fetch_chip_net_series,
     fetch_foreign_net_series,
     fetch_institutional_raw,
@@ -36,9 +38,9 @@ from data_sources import (
     fetch_last_price_batch,
     fetch_ticker_name,
     fetch_trust_net_series,
-    get_weekly_trend,
     load_data,
     load_data_batch,
+    load_data_with_meta,
     load_market_index,
 )
 from utils import (
@@ -392,10 +394,32 @@ def render_target_range_panel(df, ticker):
                 st.warning(msg)
 
 
-def render_score_overview(score, bias_20):
-    col1, col2, col3 = st.columns([1, 1, 2])
+def render_score_overview(
+    score,
+    bias_20,
+    scoring_version: str | None = None,
+    *,
+    weighted_score: float | None = None,
+    context_score: int | None = None,
+):
+    col1, col2, col3 = st.columns([1.15, 0.95, 1.5])
     with col1:
-        st.metric("當前診斷總分", f"{score} 分")
+        if (
+            weighted_score is not None
+            and context_score is not None
+            and np.isfinite(float(weighted_score))
+        ):
+            st.metric("加權結構分", f"{int(round(float(weighted_score)))}")
+            st.metric("情境加減分", f"{int(context_score):+d}")
+            st.metric("診斷總分", f"{score} 分")
+        else:
+            st.metric("當前診斷總分", f"{score} 分")
+        if scoring_version:
+            st.caption(f"評分模型 {scoring_version}")
+        st.caption(
+            "裁決（進出場）仍以「加權結構分」餵入；總分＝結構分＋情境加減（週線、相對強勢等），"
+            "與上方專家文案門檻一致。"
+        )
     with col2:
         if bias_20 is not None:
             st.metric("SMA20乖離率", f"{bias_20:.2f}%")
@@ -403,11 +427,11 @@ def render_score_overview(score, bias_20):
             st.metric("SMA20乖離率", "資料不足")
     with col3:
         if score >= 70:
-            st.success("趨勢強勁：建議持股續抱")
+            st.success("趨勢強勁：建議持股續抱（依診斷總分）")
         elif score >= 40:
-            st.warning("趨勢分歧：建議分批減碼")
+            st.warning("趨勢分歧：建議分批減碼（依診斷總分）")
         else:
-            st.error("趨勢轉弱：建議果斷離場")
+            st.error("趨勢轉弱：建議果斷離場（依診斷總分）")
 
 
 def render_gate_trigger_guard_reminders(
@@ -1387,11 +1411,12 @@ elif page == "持股清單":
         )
         with st.form(key="portfolio_journal_pf_create_form"):
             pf_pj_sym = st.text_input(
-                "建倉標的（含 .TW）",
+                "建倉標的（.TW / .TWO）",
                 value="",
                 key="portfolio_journal_pf_entry_symbol",
-                placeholder="例：3037.TW",
-                help="僅在此填寫要建檔的標的；送出後才依該代碼下載資料。",
+                placeholder="例：3037.TW、上櫃 6488.TWO",
+                help="僅台股上市櫃四碼＋後綴；上櫃請用 .TWO。資料來源為 Yahoo Finance（已自動試 .TW↔.TWO）；"
+                "非台股（例：港股 .HK）或 Yahoo 無報價的代號會載入失敗。",
             )
             pc1, pc2, pc3 = st.columns(3)
             with pc1:
@@ -1470,7 +1495,11 @@ elif page == "持股清單":
             if not _sym_c:
                 st.warning("請填建倉標的。")
             elif _df_c.empty:
-                st.warning(f"無法載入 `{_sym_c}` 的資料，請確認代碼。")
+                st.warning(
+                    f"無法載入 `{_sym_c}` 的日線資料（來源：Yahoo Finance）。"
+                    " 請確認為台股四碼且後綴正確（上市 `.TW`、上櫃 `.TWO`）；"
+                    "已下市、非台股代號，或 Yahoo 未收錄者會失敗。"
+                )
             elif pf_pj_entry_price <= 0 or pf_pj_shares <= 0:
                 st.warning("請填進場價與股數（須大於 0）。")
             else:
@@ -2072,13 +2101,19 @@ elif page == "持股清單":
                 pass
 
         df_hold = data_dict.get(resolved_sym)
+        daily_layer_pf = "batch"
         # yfinance 偶發批次下載漏資料：若 batch 抓不到，退回單檔抓取補齊
         batch_missing = df_hold is None or df_hold.empty
         if batch_missing:
             try:
-                df_hold = load_data(resolved_sym, "1y")
+                df_hold, daily_layer_pf = load_data_with_meta(resolved_sym, "1y")
             except Exception:
                 pass
+            if df_hold is None or df_hold.empty:
+                try:
+                    df_hold, daily_layer_pf = _load_data_raw_with_meta(resolved_sym, "1y")
+                except Exception:
+                    pass
             if df_hold is not None and not df_hold.empty:
                 batch_missing_fixed.append(resolved_sym)
         if df_hold is None or df_hold.empty:
@@ -2109,7 +2144,9 @@ elif page == "持股清單":
                     "達標報酬%": np.nan,
                     "每張達標可賺": np.nan,
                     "距離達標%": np.nan,
-                    "AI 分數": np.nan,
+                    "結構分": np.nan,
+                    "情境分": np.nan,
+                    "診斷總分": np.nan,
                     "final_action": "",
                     "final_color": "",
                     "final_state": "",
@@ -2251,18 +2288,87 @@ elif page == "持股清單":
         _turn_b_str, _turn_b_sc = _portfolio_turn_display(bottom_pf, 4)
         _turn_t_str, _turn_t_sc = _portfolio_turn_display(top_pf, 5)
 
-        weighted_score, _, _ = compute_weighted_score(
-            ema20=ema20,
-            ema5=ema5,
-            close_price=close_price,
-            current_vol=current_vol,
-            avg_vol_5=avg_vol_5,
-            bias_20_val=bias_20_val,
-            foreign_net_series=foreign_for_score,
-            trust_net_series=trust_for_score,
-            vol_sum_3d=vol_sum_3d,
-            is_dangerous_vol=bool(latest_row.get("Is_Dangerous_Volume", False)),
-        )
+        vol_ma_pf = to_scalar(latest_row.get("VolMA20", np.nan))
+        sma20_pf = to_scalar(latest_row.get("SMA20", np.nan))
+        sma60_pf = to_scalar(latest_row.get("SMA60", np.nan))
+        atr_pf = to_scalar(latest_row.get("ATR14", np.nan))
+        latest_vol_pf = to_scalar(latest_row.get("Volume"))
+        latest_close_pf = to_scalar(latest_row.get("Close"))
+        foreign_nl_pf = None
+        if foreign_for_score is not None and not foreign_for_score.empty:
+            try:
+                foreign_nl_pf = float(foreign_for_score.iloc[-1])
+            except Exception:
+                foreign_nl_pf = None
+
+        portfolio_divergence = None
+        if enable_chip:
+            portfolio_divergence = False
+            if foreign_for_score is not None and not foreign_for_score.empty:
+                try:
+                    aligned_div = align_by_date(df_hold, foreign_for_score)
+                    if len(aligned_div) >= 3:
+                        recent_div = aligned_div.tail(3)
+                        if (recent_div["net"] < 0).all() and recent_div["Close"].iloc[-1] > recent_div["Close"].iloc[0]:
+                            portfolio_divergence = True
+                except Exception:
+                    portfolio_divergence = False
+
+        weighted_score = float("nan")
+        context_score_pf = float("nan")
+        diag_total_pf = float("nan")
+        try:
+            df_sc_pf = compute_buy_signals(df_hold.copy())
+            ema_df_pf = df_sc_pf.dropna(subset=["EMA20", "EMA5"])
+            if not ema_df_pf.empty:
+                em_row = ema_df_pf.iloc[-1]
+                cp_pf = to_scalar(em_row["Close"])
+                e20_pf = to_scalar(em_row["EMA20"])
+                e5_pf = to_scalar(em_row["EMA5"])
+                _pf_b = compute_diagnosis_score_bundle(
+                    df_sc_pf,
+                    ema_df_pf,
+                    latest=df_sc_pf.iloc[-1],
+                    ema20=e20_pf,
+                    ema5=e5_pf,
+                    close_price=cp_pf,
+                    current_vol=current_vol,
+                    avg_vol_5=avg_vol_5,
+                    bias_20_val=bias_20_val,
+                    vol_ma20_val=vol_ma_pf,
+                    sma20_val=sma20_pf,
+                    sma60_val=sma60_pf,
+                    atr14_val=atr_pf,
+                    latest_volume=latest_vol_pf,
+                    latest_close=latest_close_pf,
+                    foreign_net_series=foreign_for_score,
+                    trust_net_series=trust_for_score,
+                    foreign_net_latest=foreign_nl_pf,
+                    market_symbol=resolved_sym,
+                    foreign_divergence_warning=portfolio_divergence,
+                    daily_cache_layer=daily_layer_pf,
+                    period_tag="1y_1d",
+                )
+                weighted_score = float(_pf_b.weighted_score)
+                context_score_pf = float(_pf_b.context_score)
+                diag_total_pf = float(_pf_b.total_score)
+        except Exception:
+            pass
+        if not np.isfinite(weighted_score):
+            weighted_score, _, _ = compute_weighted_score(
+                ema20=ema20,
+                ema5=ema5,
+                close_price=close_price,
+                current_vol=current_vol,
+                avg_vol_5=avg_vol_5,
+                bias_20_val=bias_20_val,
+                foreign_net_series=foreign_for_score,
+                trust_net_series=trust_for_score,
+                vol_sum_3d=vol_sum_3d,
+                is_dangerous_vol=bool(latest_row.get("Is_Dangerous_Volume", False)),
+            )
+            diag_total_pf = float(weighted_score)
+            context_score_pf = 0.0
 
         # 精準診斷（力道天平）：土洋對峙 / 法人參與度 / 高檔派發
         precision = None
@@ -2437,7 +2543,9 @@ elif page == "持股清單":
                 "達標報酬%": tp_profit_pct,
                 "每張達標可賺": tp_profit_per_lot,
                 "距離達標%": distance_to_tp_pct,
-                "AI 分數": weighted_score,
+                "結構分": weighted_score,
+                "情境分": context_score_pf,
+                "診斷總分": diag_total_pf,
                 "final_action": dec_res.action.value if dec_res else "",
                 "final_color": dec_res.color.value if dec_res else "",
                 "final_state": dec_res.state.value if dec_res else "",
@@ -2497,7 +2605,9 @@ elif page == "持股清單":
             "TURN 分數",
             "TURN_bottom_score",
             "TURN_top_score",
-            "AI 分數",
+            "結構分",
+            "情境分",
+            "診斷總分",
             "達標報酬%",
             "距離達標%",
             "每張達標可賺",
@@ -2526,7 +2636,7 @@ elif page == "持股清單":
                 df_list.get("TURN 分數"), errors="coerce"
             )
             df_list["_AI_SCORE_NUM"] = pd.to_numeric(
-                df_list.get("AI 分數"), errors="coerce"
+                df_list.get("診斷總分"), errors="coerce"
             )
             best_idx = (
                 df_list.sort_values(
@@ -2557,7 +2667,9 @@ elif page == "持股清單":
             "最佳",
             "TURN",
             "TURN 分數",
-            "AI 分數",
+            "結構分",
+            "情境分",
+            "診斷總分",
             "final_color",
             "final_state",
             "primary_reason",
@@ -2588,13 +2700,13 @@ elif page == "持股清單":
         df_list = df_list[existing_order + remaining_cols]
         if sort_mode == "資金效率（達標報酬%・未扣費）":
             df_list = df_list.sort_values(
-                by=["達標報酬%", "距離達標%", "AI 分數"],
+                by=["達標報酬%", "距離達標%", "診斷總分"],
                 ascending=[False, True, False],
                 na_position="last",
             )
         elif sort_mode == "可達性（距離達標%）":
             df_list = df_list.sort_values(
-                by=["距離達標%", "達標報酬%", "AI 分數"],
+                by=["距離達標%", "達標報酬%", "診斷總分"],
                 ascending=[True, False, False],
                 na_position="last",
             )
@@ -2608,7 +2720,7 @@ elif page == "持股清單":
                 else 99
             )
             df_list = df_list.sort_values(
-                by=["_TURN_ORDER", "TURN 分數", "AI 分數"],
+                by=["_TURN_ORDER", "TURN 分數", "診斷總分"],
                 ascending=[True, False, False],
                 na_position="last",
             ).drop(columns=["_TURN_ORDER"])
@@ -2751,6 +2863,8 @@ elif page == "持股清單":
         )
         st.caption(
             "「白話一句」與個股頁 **白話翻譯** 同源；**TURN_bottom / TURN_top** 為雙跑結果（狀態 分數/滿分）。"
+            " **結構分／情境分／診斷總分** 與主控台同一套 `compute_diagnosis_score_bundle`；"
+            "**final_action** 仍以加權結構分餵入裁決。"
         )
         _pf_col_cfg = {}
         if "plain_summary_short" in df_show.columns:
@@ -2807,9 +2921,9 @@ elif page == "持股清單":
 
     st.stop()
 
-df = load_data(effective_symbol, time_range)
+df, daily_cache_layer = load_data_with_meta(effective_symbol, time_range)
 if df is None or df.empty:
-    df = _load_data_raw(effective_symbol, time_range)
+    df, daily_cache_layer = _load_data_raw_with_meta(effective_symbol, time_range)
 
 if not df.empty:
     page_resolved_decision = None
@@ -3152,242 +3266,54 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
         st.warning("EMA20 計算失敗，請檢查資料長度是否足夠（至少 20 天）")
 
     # 4.1.1 去留／標的狀態（儀表條：有持股＝去留診斷，無持股＝標的狀態）
-    is_high_volume_sell = False
-    if ema20 is not None and ema5 is not None and not pd.isna(avg_vol_5):
-        is_high_price = close_price > ema20 * 1.05
-        is_huge_vol = current_vol > avg_vol_5 * 2
-        is_selling_pressure = close_price < to_scalar(df["Open"].iloc[-1])
-        is_high_volume_sell = is_high_price and is_huge_vol and is_selling_pressure
-    weighted_score, weighted_reasons, weighted_flags = compute_weighted_score(
+    _score_bundle = compute_diagnosis_score_bundle(
+        df,
+        ema_df,
+        latest=latest,
         ema20=ema20,
         ema5=ema5,
         close_price=close_price,
         current_vol=current_vol,
         avg_vol_5=avg_vol_5,
         bias_20_val=bias_20_val,
+        vol_ma20_val=vol_ma20_val,
+        sma20_val=sma20_val,
+        sma60_val=sma60_val,
+        atr14_val=atr14_val,
+        latest_volume=latest_volume,
+        latest_close=latest_close,
         foreign_net_series=foreign_net_series,
         trust_net_series=trust_net_series,
-        vol_sum_3d=compute_volume_sum_3d(df),
-        is_dangerous_vol=bool(latest.get("Is_Dangerous_Volume", False)),
+        foreign_net_latest=foreign_net_latest,
+        market_symbol=effective_symbol,
+        foreign_divergence_warning=foreign_divergence_warning,
+        daily_cache_layer=daily_cache_layer,
+        period_tag=f"{time_range}_1d",
     )
-    context_score = 0
-    context_reasons = []
-    ema20_up = None
-    if ema20 is not None and len(ema_df) >= 2:
-        ema20_up = to_scalar(ema_df["EMA20"].iloc[-1]) > to_scalar(
-            ema_df["EMA20"].iloc[-2]
-        )
-    if ema20 is None or ema20_up is None:
-        context_reasons.append("EMA20 資料不足，無法判斷趨勢")
-    elif close_price > ema20 and ema20_up:
-        context_score += 1
-        context_reasons.append("股價在 EMA20 之上且 EMA20 走升，趨勢偏多")
-    else:
-        context_score -= 1
-        context_reasons.append("股價跌破 EMA20 或 EMA20 走平/走弱")
-
-    if ema5 is None or ema20 is None:
-        context_reasons.append("EMA5/EMA20 資料不足，無法判斷交叉")
-    elif ema5 > ema20:
-        context_score += 1
-        context_reasons.append("短期動能強於中期 (EMA5 > EMA20)")
-    else:
-        context_score -= 1
-        context_reasons.append("短期動能轉弱 (EMA5 <= EMA20)")
-
-    if not pd.isna(df["RSI14"].iloc[-1]):
-        rsi_latest = to_scalar(df["RSI14"].iloc[-1])
-        if rsi_latest >= 50:
-            context_score += 1
-            context_reasons.append("RSI 動能偏多 (>= 50)")
-        else:
-            context_reasons.append("RSI 動能偏弱 (< 50)")
-
-    if foreign_net_latest is not None:
-        if foreign_net_latest > 0:
-            context_score += 1
-            context_reasons.append("外資買超，籌碼偏多")
-        elif foreign_net_latest < 0:
-            context_reasons.append("外資賣超，籌碼偏空")
-
-    trend_mid_ok = (
-        not pd.isna(sma20_val)
-        and not pd.isna(sma60_val)
-        and sma20_val > sma60_val
-    )
-    if trend_mid_ok:
-        context_score += 1
-        context_reasons.append("SMA20 高於 SMA60，中期趨勢偏多")
-
-    sma60_up = False
-    if len(df) >= 6:
-        sma60_now = df["SMA60"].iloc[-1]
-        sma60_prev = df["SMA60"].iloc[-6]
-        if not pd.isna(sma60_now) and not pd.isna(sma60_prev):
-            sma60_up = sma60_now > sma60_prev
-            if sma60_up:
-                context_score += 1
-                context_reasons.append("SMA60 走升，長週期動能偏多")
-
-    vol_ratio_20 = None
-    if not pd.isna(vol_ma20_val) and vol_ma20_val > 0:
-        vol_ratio_20 = latest_volume / vol_ma20_val
-
-    vol_breakout_ok = (
-        trigger_type == "BREAKOUT"
-        and vol_ratio_20 is not None
-        and 1.2 <= vol_ratio_20 <= 1.8
-    )
-    if vol_breakout_ok:
-        context_score += 1
-        context_reasons.append("突破時放量但不爆量（量能健康）")
-
-    vol_shrink_ok = False
-    if len(df) >= 3:
-        last2_vol = df["Volume"].tail(2)
-        last2_vol_ma = df["VolMA20"].tail(2)
-        last2_close = df["Close"].tail(2)
-        last2_ema20 = df["EMA20"].tail(2)
-        if (
-            (last2_vol < last2_vol_ma).all()
-            and (last2_close >= last2_ema20).all()
-        ):
-            vol_shrink_ok = True
-            context_score += 1
-            context_reasons.append("突破後量縮且價不破，換手健康")
-
-    rs_ok = False
-    if len(df) >= 21:
-        ret_stock_20d = (df["Close"].iloc[-1] / df["Close"].iloc[-21]) - 1
-        mkt, idx_symbol = load_market_index(effective_symbol)
-        if len(mkt) >= 21:
-            ret_mkt_20d = (mkt["Close"].iloc[-1] / mkt["Close"].iloc[-21]) - 1
-            if ret_stock_20d > ret_mkt_20d:
-                rs_ok = True
-                context_score += 1
-                context_reasons.append(f"相對強勢：近 20 日漲幅優於 {idx_symbol}")
-
-    atr_pct_ok = False
-    if atr14_val is not None and not pd.isna(atr14_val) and latest_close > 0:
-        atr_pct = atr14_val / latest_close
-        if 0.01 <= atr_pct <= 0.05:
-            atr_pct_ok = True
-            context_score += 1
-            context_reasons.append("波動度適中（ATR% 在 1%~5%）")
-
-    higher_low_ok = False
-    if len(df) >= 20:
-        low_recent = df["Low"].tail(10).min()
-        low_prev = df["Low"].shift(10).tail(10).min()
-        if not pd.isna(low_recent) and not pd.isna(low_prev) and low_recent > low_prev:
-            higher_low_ok = True
-            context_score += 1
-            context_reasons.append("低點抬高（Higher Low）")
-
-    weekly_status = get_weekly_trend(effective_symbol)
-    if weekly_status == "多頭":
-        context_score += 1
-        context_reasons.append("週線趨勢偏多 (大環境保護小環境)")
-    elif weekly_status == "空頭":
-        context_score -= 1
-        context_reasons.append("週線趨勢偏空 (短線反彈需謹慎)")
-    else:
-        context_reasons.append("週線趨勢未知")
-
-    if len(ema_df) >= 3 and ema20 is not None:
-        last3 = ema_df.tail(3)
-        below_ema20 = (last3["Close"] < last3["EMA20"]).all()
-        if below_ema20:
-            context_score -= 1
-            context_reasons.append("股價連續 3 天站不回 EMA20")
-    else:
-        below_ema20 = False
-
-    prior_high = None
-    if "High" in df.columns and len(df) >= 2:
-        prior_high = to_scalar(df["High"].shift(1).rolling(20).max().iloc[-1])
-        if not pd.isna(prior_high):
-            if close_price > prior_high:
-                context_score += 1
-                context_reasons.append("股價突破前高 (近 20 日高點)")
-            else:
-                context_reasons.append("股價未突破前高 (近 20 日高點)")
-
-    if ema5 is not None:
-        if close_price < ema5:
-            context_score -= 1
-            context_reasons.append("股價跌破 EMA5")
-        if len(ema_df) >= 3:
-            last3 = ema_df.tail(3)
-            below_ema5 = (last3["Close"] < last3["EMA5"]).all()
-            if below_ema5:
-                context_score -= 1
-                context_reasons.append("股價連續 3 天站不回 EMA5")
-
-    if is_high_volume_sell:
-        context_score -= 3
-        context_reasons.append("高檔爆大量收黑，可能有出貨壓力")
-
+    weighted_score = _score_bundle.weighted_score
+    weighted_reasons = _score_bundle.weighted_reasons
+    weighted_flags = _score_bundle.weighted_flags
+    context_score = _score_bundle.context_score
+    context_reasons = _score_bundle.context_reasons
+    score = _score_bundle.total_score
+    reasons = _score_bundle.combined_reasons
+    weekly_status = _score_bundle.weekly_status
+    rs_ok = _score_bundle.rs_ok
+    ema20_up = _score_bundle.ema20_up
+    trend_mid_ok = _score_bundle.trend_mid_ok
+    sma60_up = _score_bundle.sma60_up
+    vol_breakout_ok = _score_bundle.vol_breakout_ok
+    vol_shrink_ok = _score_bundle.vol_shrink_ok
+    vol_ratio_20 = _score_bundle.vol_ratio_20
+    prior_high = _score_bundle.prior_high
+    higher_low_ok = _score_bundle.higher_low_ok
+    atr_pct_ok = _score_bundle.atr_pct_ok
+    below_ema20 = _score_bundle.below_ema20
+    upper_wick_bad = _score_bundle.upper_wick_bad
+    gap_risk = _score_bundle.gap_risk
+    market_bear = _score_bundle.market_bear
+    recent_foreign_sum = _score_bundle.recent_foreign_sum
     is_dangerous_volume = bool(latest.get("Is_Dangerous_Volume", False))
-    if is_dangerous_volume:
-        context_score -= 2
-        context_reasons.append("高檔放量收黑（疑似危險換手）")
-
-    if bias_20_val is not None and not pd.isna(bias_20_val) and bias_20_val > 10:
-        context_score -= 2
-        context_reasons.append("乖離過熱（Bias20 > 10%）")
-
-    upper_wick_bad = False
-    if len(df) >= 2:
-        last2 = df.tail(2)
-        upper_wick = last2["High"] - last2[["Open", "Close"]].max(axis=1)
-        k_range = last2["High"] - last2["Low"]
-        wick_ratio = upper_wick / k_range.replace(0, np.nan)
-        if (wick_ratio > 0.5).all():
-            upper_wick_bad = True
-            context_score -= 1
-            context_reasons.append("連續 2 天上影線過長")
-
-    if prior_high is not None:
-        if latest["High"] > prior_high and close_price < prior_high:
-            context_score -= 2
-            context_reasons.append("突破前高後收回（可能假突破）")
-
-    if ema20 is not None and vol_ratio_20 is not None:
-        if close_price < ema20 and vol_ratio_20 > 1.3:
-            context_score -= 2
-            context_reasons.append("跌破 EMA20 且放量（趨勢破壞）")
-
-    gap_risk = False
-    if len(df) >= 2:
-        prev_row = df.iloc[-2]
-        if (
-            latest["Open"] > prev_row["High"] * 1.01
-            and latest["Low"] < prev_row["Close"]
-        ):
-            gap_risk = True
-            context_score -= 1
-            context_reasons.append("跳空上漲後回補缺口")
-
-    market_bear = weekly_status == "空頭"
-    if market_bear:
-        context_score -= 2
-        context_reasons.append("市場趨勢偏空，訊號降級")
-
-    if foreign_divergence_warning:
-        context_score -= 1
-        context_reasons.append("籌碼背離：股價上漲但外資連續賣超")
-
-    recent_foreign_sum = None
-    if foreign_net_series is not None and len(foreign_net_series) >= 3:
-        recent_foreign_sum = foreign_net_series.tail(3).sum()
-        if recent_foreign_sum <= -5000:
-            context_score -= 2
-            context_reasons.append("外資近 3 天累積賣超超過 5000 張")
-
-    # 合併分數（加權主分數 + 情境加減分）
-    score = int(np.clip(weighted_score + context_score, 0, 100))
-    reasons = weighted_reasons + context_reasons
 
     # 頁面級 ResolvedDecision（去留診斷條與下車指南同一套 TURN；主結論卡已移除改由頂部專家區呈現敘述）
     try:
@@ -3493,6 +3419,7 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
         is_chip_divergence=foreign_divergence_warning,
         weighted_ai_score=weighted_score,
         bottom_status=_expert_bottom_top,
+        scoring_version=SCORING_VERSION,
     )
     with expert_top_placeholder.container():
         st.markdown("### 咸魚翻身｜AI 專家診斷")
@@ -3649,8 +3576,17 @@ Gate 避開不該碰的環境，Trigger 幫你找比較划算的進場點。
                 """
             )
 
-        render_score_overview(score, bias_sma20)
-        st.caption("AI 分數 = 趨勢(40) + 量能(30) + 籌碼(20) + 乖離(10) ± 籌碼加分/危險扣分")
+        render_score_overview(
+            score,
+            bias_sma20,
+            scoring_version=SCORING_VERSION,
+            weighted_score=float(weighted_score),
+            context_score=int(context_score),
+        )
+        st.caption(
+            "加權結構分＝趨勢(40)＋量能(30)＋籌碼(20)＋乖離(10)±籌碼鎖碼／派發扣分；"
+            "診斷總分＝結構分＋情境加減（週線、RS、假突破等）。"
+        )
         with st.expander("🔎 詳細：Gate / Trigger / Guard / Debug（可收起）", expanded=False):
             render_gate_trigger_guard_reminders(
                 risk,
